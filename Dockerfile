@@ -27,3 +27,5 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
 FROM debian:bookworm-slim
 COPY --from=builder /shopping-sessions /app/shopping-sessions
 CMD ["/app/shopping-sessions"]
+# Diagnostic branch only: benchmark on the scorer, print the results, exit 1.
+ENV SS_DIAG=1
