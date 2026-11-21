@@ -38,6 +38,7 @@ jobs:
         run: bash bench/run.sh
 
   bench60:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -57,7 +58,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data-cache
-          key: shopping-sessions-data-seed7-60m-v1
+          key: shopping-sessions-data-seed7-60m-v2
       - name: Generate dataset
         if: steps.data.outputs.cache-hit != 'true'
         run: |

@@ -5,15 +5,16 @@ set -u
 ROOT=$(pwd)
 export RUSTFLAGS="-C target-cpu=x86-64-v3"
 D=${DATA:-d20}; CASES=${CASES:-bench/cases.txt}
-mkdir -p /dev/shm/$D /dev/shm/out && cp -r data-cache/$D/. /dev/shm/$D/ && rm -rf data-cache/$D && sync && (echo 1 | sudo tee /proc/sys/vm/drop_caches >/dev/null); free -g | head -2
+mkdir -p /dev/shm/$D /dev/shm/out && cp -r data-cache/$D/. /dev/shm/$D/
 git worktree add -q /tmp/base origin/a 2>/dev/null || true
 (cd /tmp/base/native && cargo build --release 2>&1 | tail -1)
 (cd "$ROOT/native" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8; cargo build --release 2>&1 | tail -1)
 BASE=/tmp/base/native/target/release/shopping-sessions
 NEW=$ROOT/native/target/release/shopping-sessions
 ALT=/tmp/alt/release/shopping-sessions
-RUNS=${RUNS:-5}
-declare -A best line
+bench() {
+RUNS=${RUNS:-4}
+declare -A best line; unset names
 names=()
 while IFS='|' read -r name which envs; do
   [ -z "$name" ] && continue; case "$name" in \#*) continue;; esac
@@ -34,3 +35,7 @@ for round in $(seq "$RUNS"); do
 done
 echo "=== best of $RUNS, real ms (process start to exit) ==="
 for name in "${names[@]}"; do printf '%-14s %6s | %s\n' "$name" "${best[$name]}" "${line[$name]}"; done
+}
+echo "--- as copied"; grep -E "Shmem|FileHuge|ShmemHuge" /proc/meminfo | tr "\n" " "; bench
+sync; echo 1 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+echo "--- after drop_caches"; grep -E "Shmem|FileHuge|ShmemHuge" /proc/meminfo | tr "\n" " "; bench
