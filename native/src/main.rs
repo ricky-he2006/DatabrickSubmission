@@ -341,9 +341,8 @@ impl Keys {
                 {
                     // PEXT keeps seven bits per byte, in the same order as the
                     // portable shifts. The release's x86-64-v3 target has BMI2.
-                    let packed = unsafe {
-                        std::arch::x86_64::_pext_u64(bytes, 0x7f7f_7f7f_7f7f_7f7f)
-                    };
+                    let packed =
+                        unsafe { std::arch::x86_64::_pext_u64(bytes, 0x7f7f_7f7f_7f7f_7f7f) };
                     return (u64::from(value[0]) << 56) | packed;
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
@@ -552,57 +551,63 @@ fn main() -> io::Result<()> {
             Ok(table)
         },
         || {
-            let chunks: Vec<_> = blocks(&event_maps)
-                .par_iter()
-                .map(|block| {
+            let blocks = blocks(&event_maps);
+            // Each task reuses its event partitions across four complete
+            // input blocks, leaving enough tasks for Rayon to balance work.
+            let chunks: Vec<_> = blocks
+                .par_chunks(4)
+                .map(|blocks| {
+                    let capacity = blocks.iter().map(|block| block.len()).sum::<usize>() / 8192;
                     let mut bins: [Vec<_>; 128] =
-                        std::array::from_fn(|_| Vec::with_capacity(block.len() / 8192));
-                    memchr::memchr_iter(b'\n', block)
-                        .chain((block.last() != Some(&b'\n')).then_some(block.len()))
-                        .scan(0, |pos, end| {
-                            let row = &block[*pos..end];
-                            *pos = end + 1;
-                            Some(row)
-                        })
-                        .filter_map(|line| {
-                            let f = fields::<7>(line)?;
-                            if f[0].is_empty() {
-                                return None;
-                            }
-                            let ingested = timestamp(f[3])?;
-                            let ms = timestamp(f[2]).unwrap_or(i64::MIN);
-                            let purchase = f[4] == b"purchase";
-                            let price = if purchase {
-                                number(f[6]).unwrap_or(0)
-                            } else {
-                                0
-                            };
-                            let valid = ms >= start
-                                && ms < end
-                                && ingested - ms <= DAY
-                                && !f[1].is_empty()
-                                && !f[5].is_empty()
-                                && (matches!(f[4], b"cart" | b"view")
-                                    || purchase && (1..=10000000).contains(&price));
-                            let user = keys.key(f[1]);
-                            let person = user;
-                            Some((
-                                event_keys.key(f[0]),
-                                ingested,
-                                person,
-                                if valid { ms } else { i64::MIN },
-                                if valid { price as u32 } else { 0 },
-                                if purchase {
-                                    *products.get(f[5]).unwrap_or(&0)
+                        std::array::from_fn(|_| Vec::with_capacity(capacity));
+                    for block in blocks {
+                        memchr::memchr_iter(b'\n', block)
+                            .chain((block.last() != Some(&b'\n')).then_some(block.len()))
+                            .scan(0, |pos, end| {
+                                let row = &block[*pos..end];
+                                *pos = end + 1;
+                                Some(row)
+                            })
+                            .filter_map(|line| {
+                                let f = fields::<7>(line)?;
+                                if f[0].is_empty() {
+                                    return None;
+                                }
+                                let ingested = timestamp(f[3])?;
+                                let ms = timestamp(f[2]).unwrap_or(i64::MIN);
+                                let purchase = f[4] == b"purchase";
+                                let price = if purchase {
+                                    number(f[6]).unwrap_or(0)
                                 } else {
                                     0
-                                },
-                            ))
-                        })
-                        .for_each(|row| {
-                            let bin = (row.0.wrapping_mul(11400714819323198485) >> 57) as usize;
-                            bins[bin].push(row);
-                        });
+                                };
+                                let valid = ms >= start
+                                    && ms < end
+                                    && ingested - ms <= DAY
+                                    && !f[1].is_empty()
+                                    && !f[5].is_empty()
+                                    && (matches!(f[4], b"cart" | b"view")
+                                        || purchase && (1..=10000000).contains(&price));
+                                let user = keys.key(f[1]);
+                                let person = user;
+                                Some((
+                                    event_keys.key(f[0]),
+                                    ingested,
+                                    person,
+                                    if valid { ms } else { i64::MIN },
+                                    if valid { price as u32 } else { 0 },
+                                    if purchase {
+                                        *products.get(f[5]).unwrap_or(&0)
+                                    } else {
+                                        0
+                                    },
+                                ))
+                            })
+                            .for_each(|row| {
+                                let bin = (row.0.wrapping_mul(11400714819323198485) >> 57) as usize;
+                                bins[bin].push(row);
+                            });
+                    }
                     bins
                 })
                 .collect();
