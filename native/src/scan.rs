@@ -119,7 +119,8 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
     }
 }
 
-/// Commas, newlines and quotes of the 64 bytes at `p`, one bit per byte.
+/// Separators (commas and newlines), newlines and quotes of the 64 bytes at
+/// `p`, one bit per byte.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
@@ -133,7 +134,8 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
             let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, wanted)) as u32 as u64;
             a | (b << 32)
         };
-        (find(b','), find(b'\n'), find(b'"'))
+        let (comma, newline) = (find(b','), find(b'\n'));
+        (comma | newline, newline, find(b'"'))
     }
 }
 
@@ -161,7 +163,8 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
             }
             out
         };
-        (find(b','), find(b'\n'), find(b'"'))
+        let (comma, newline) = (find(b','), find(b'\n'));
+        (comma | newline, newline, find(b'"'))
     }
 }
 
@@ -176,7 +179,7 @@ unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
             newlines |= u64::from(byte == b'\n') << at;
             quotes |= u64::from(byte == b'"') << at;
         }
-        (commas, newlines, quotes)
+        (commas | newlines, newlines, quotes)
     }
 }
 
@@ -205,6 +208,27 @@ unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) 
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
 const WINDOW: usize = 64;
+
+/// Field `at` of a line from `raw_lines`, without its quotes: (from, to).
+#[inline(always)]
+pub unsafe fn bounds<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N], at: usize) -> (u32, u32) {
+    unsafe {
+        let from = if at == 0 { start } else { *seps.get_unchecked(at - 1) + 1 };
+        let to = *seps.get_unchecked(at);
+        // In a well-formed line a field that starts with a quote ends with one.
+        let quoted = u32::from(*buf.add(from as usize) == b'"');
+        (from + quoted, to - quoted)
+    }
+}
+
+/// Field `at` of a line from `raw_lines`, without its quotes: (first byte, length).
+#[inline(always)]
+pub unsafe fn field<const N: usize>(buf: *const u8, start: u32, seps: &[u32; N], at: usize) -> (*const u8, usize) {
+    unsafe {
+        let (from, to) = bounds(buf, start, seps, at);
+        (buf.add(from as usize), (to - from) as usize)
+    }
+}
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -344,13 +368,12 @@ impl Block {
         Ok(())
     }
 
-    /// The fields of the line starting at `start`, the old way: the line's
-    /// bytes in 64-byte windows. Returns where its newline is, and the fields
-    /// if the line is well formed.
+    /// The separators of the line starting at `start`, the old way: its
+    /// bytes in 64-byte windows. `None` if the line is malformed.
     #[inline(never)]
-    unsafe fn split_line<const N: usize>(buf: *const u8, start: usize) -> (usize, Option<[(u32, u32); N]>) {
+    unsafe fn split_line<const N: usize>(buf: *const u8, start: usize) -> Option<[u32; N]> {
         unsafe {
-            let mut fields = [(0u32, 0u32); N];
+            let mut seps = [0u32; N];
             let mut count = 0usize;
             let mut ok = true;
             let mut start = start;
@@ -365,43 +388,43 @@ impl Block {
                     shift = 0;
                     rest = ends;
                 }
-                let (stop, fine, opens) = if rest != 0 {
+                let (stop, fine) = if rest != 0 {
                     let length = rest.trailing_zeros();
                     let inside = (quotes >> shift) & ((1u64 << length) - 1);
                     let opens = inside & 1;
                     let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
-                    (
-                        start + length as usize,
-                        inside == wanted && (opens == 0 || length >= 2),
-                        opens as usize,
-                    )
+                    (start + length as usize, inside == wanted && (opens == 0 || length >= 2))
                 } else {
                     ends = 0;
-                    long_field(buf, start)
+                    let (stop, fine, _) = long_field(buf, start);
+                    (stop, fine)
                 };
                 ok &= fine;
                 if count < N {
-                    fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+                    seps[count] = stop as u32;
                 }
                 count += 1;
                 if *buf.add(stop) == b'\n' {
-                    return (stop, if ok && count == N { Some(fields) } else { None });
+                    return if ok && count == N { Some(seps) } else { None };
                 }
                 start = stop + 1;
             }
         }
     }
 
-    /// Hands every well-formed line of the block to `visit`, as its fields.
+    /// Hands every well-formed line of the block to `visit` as where it starts
+    /// and its `N` separators: `N - 1` commas, then its newline. Fields still
+    /// have their quotes; `field` takes them off.
     ///
-    /// The bytes are classified 64 at a time, and the positions of commas and
-    /// newlines written out a window at a time; a line is then its newline and
-    /// the commas before it. Quote rules are checked on the masks: every quote
-    /// must start or end a field, a field that starts with one must end with
-    /// one, and a lone `"` is no field. A 64-byte chunk that breaks one of these
-    /// sends its lines down the old path, which says exactly which are wrong.
+    /// The bytes are classified 64 at a time and the positions of separators
+    /// and newlines written out a window at a time; a line is well formed when
+    /// its `N`th separator is its newline. Quote rules are checked on the
+    /// masks: every quote must start or end a field, a field that starts with
+    /// one must end with one, and a lone `"` is no field. A 64-byte chunk that
+    /// breaks one of these sends its lines down the old path, which says
+    /// exactly which are wrong.
     #[inline(always)]
-    pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
+    pub fn raw_lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
@@ -413,7 +436,7 @@ impl Block {
                 return;
             }
             let end = end as u32;
-            let mut commas: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+            let mut seps: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
             let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
             // Starts of chunks that break a quote rule; the last is a sentinel.
             let mut bad: Vec<u32> = Vec::new();
@@ -421,35 +444,34 @@ impl Block {
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
             let mut at = line;
-            // A quoted field open across the chunk edge: its closing separator
-            // is still to come.
+            // 1 while a field that opened with a quote has its closing
+            // separator still to come.
             let mut carry = u64::from(*buf.add(line as usize) == b'"');
             while at < end {
-                if commas.capacity() < kept + WINDOW * 64 + 128 {
-                    // The commas kept from the last window move with the buffer.
-                    commas.set_len(kept);
-                    commas.reserve(WINDOW * 64 + 128);
+                if seps.capacity() < kept + WINDOW * 64 + 128 {
+                    // The separators kept from the last window move with the buffer.
+                    seps.set_len(kept);
+                    seps.reserve(WINDOW * 64 + 128);
                 }
                 let mut count = kept;
                 let mut lines = 0usize;
-                let out = commas.as_mut_ptr();
+                let out = seps.as_mut_ptr();
                 let ends = newlines.as_mut_ptr();
-                let mut chunk = 0;
-                while chunk < WINDOW && at < end {
+                let stop_at = end.min(at.saturating_add((WINDOW * 64) as u32));
+                while at < stop_at {
                     let p = buf.add(at as usize);
                     fetch(p.wrapping_add(READ_AHEAD));
-                    let (mut comma, mut newline, mut quote) = classes(p);
+                    let (mut sep, mut newline, mut quote) = classes(p);
                     let left = end - at;
                     if left < 64 {
                         let valid = (1u64 << left) - 1;
-                        comma &= valid;
+                        sep &= valid;
                         newline &= valid;
                         quote &= valid;
                     }
                     let before = *p.sub(1);
                     // A quote just before the chunk can close a field at its first byte.
-                    if quote != 0 || carry != 0 || before == b'"' {
-                        let sep = comma | newline;
+                    if (quote | carry) != 0 || before == b'"' {
                         let after = *p.add(64);
                         let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
                         let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
@@ -458,72 +480,70 @@ impl Block {
                         let opening = quote & sep_before;
                         let closing = quote & sep_after;
                         let mut wrong = (quote & !(opening | closing)) | (opening & closing);
-                        // Separators after an opening quote's field, found by a carry
-                        // through each run of non-separators; they must be the
-                        // separators right after a closing quote.
+                        // The separator ending each field that opened with a quote,
+                        // found by a carry through the run of non-separators after
+                        // it; it must be a separator right after a closing quote.
                         let opens = sep & quote_after;
                         let (sum, over) = (!sep).overflowing_add(opens << 1);
                         let (sum, over2) = sum.overflowing_add(carry);
-                        let mut closes = sum & sep;
-                        if left < 64 {
-                            closes &= (1u64 << left) - 1;
-                        }
+                        let closes = sum & sep;
                         wrong |= closes ^ (sep & quote_before);
                         carry = u64::from(over | over2) | (opens >> 63);
                         if wrong != 0 {
                             bad.push(at);
                         }
                     }
-                    count += flatten::<8>(comma, at, out.add(count));
+                    count += flatten::<10>(sep, at, out.add(count));
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
-                    chunk += 1;
                 }
-                // Sentinels: a line's commas are found by position.
+                // Sentinels: a line's separators are found by position.
                 for extra in 0..N {
                     *out.add(count + extra) = u32::MAX;
                 }
                 bad.push(u32::MAX - 64);
-                let mut comma_at = 0usize;
-                let mut fields = [(0u32, 0u32); N];
+                let mut sep_at = 0usize;
                 for &stop in std::slice::from_raw_parts(ends, lines) {
                     let start = line;
                     line = stop + 1;
                     while *bad.get_unchecked(bad_at) + 64 <= start {
                         bad_at += 1;
                     }
-                    if N >= 2
-                        && *out.add(comma_at + N - 2) < stop
-                        && *out.add(comma_at + N - 1) > stop
-                        && *bad.get_unchecked(bad_at) > stop
-                    {
-                        let mut from = start;
-                        for field in 0..N {
-                            let to = if field + 1 < N { *out.add(comma_at + field) } else { stop };
-                            let quoted = u32::from(*buf.add(from as usize) == b'"');
-                            *fields.get_unchecked_mut(field) = (from + quoted, to - quoted);
-                            from = to + 1;
-                        }
-                        comma_at += N - 1;
-                        visit(buf, &fields);
+                    let clean = *bad.get_unchecked(bad_at) > stop;
+                    if *out.add(sep_at + N - 1) == stop && clean {
+                        visit(buf, start, &*(out.add(sep_at) as *const [u32; N]));
+                        sep_at += N;
                         continue;
                     }
-                    while *out.add(comma_at) < stop {
-                        comma_at += 1;
+                    while *out.add(sep_at) < stop {
+                        sep_at += 1;
                     }
-                    if *bad.get_unchecked(bad_at) <= stop {
-                        let (_, found) = Self::split_line::<N>(buf, start as usize);
-                        if let Some(found) = found {
-                            visit(buf, &found);
+                    sep_at += 1;
+                    if !clean {
+                        if let Some(found) = Self::split_line::<N>(buf, start as usize) {
+                            visit(buf, start, &found);
                         }
                     }
                 }
                 bad.pop();
-                // Commas of the line still open move to the front.
-                kept = count - comma_at;
-                std::ptr::copy(out.add(comma_at), out, kept);
+                // Separators of the line still open move to the front.
+                kept = count - sep_at;
+                std::ptr::copy(out.add(sep_at), out, kept);
             }
         }
+    }
+
+    /// `raw_lines`, with every field's bounds worked out and unquoted.
+    #[inline(always)]
+    pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
+        self.raw_lines::<N>(|buf, start, seps| unsafe {
+            let mut fields = [(0u32, 0u32); N];
+            for at in 0..N {
+                let (from, to) = bounds(buf, start, seps, at);
+                fields[at] = (from, to);
+            }
+            visit(buf, &fields);
+        });
     }
 
     #[allow(dead_code)]

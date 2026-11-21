@@ -12,6 +12,8 @@ RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 BIN=/tmp/p/native/target/release/shopping-sessions
 run() { rm -rf /dev/shm/out/*; env DATA_DIR=/dev/shm/d20 OUTPUT_DIR=/dev/shm/out NCPU=4 "$@"; }
 for i in 1 2 3; do run $BIN; done
+for i in 1 2; do run /usr/bin/time -f "%e real %U user %S sys %F majflt %R minflt" $BIN; done
+for i in 1 2; do run /usr/bin/time -f "1thr: %e real %U user %S sys %R minflt" env NCPU=1 $BIN; done
 run $PERF stat -e task-clock,cycles,instructions,page-faults,branches,branch-misses $BIN 2>&1 | grep -vE "^$"
 run $PERF stat -d -d $BIN 2>&1 | grep -vE "^$"
 run $PERF stat -e dTLB-loads,dTLB-load-misses,dTLB-stores,dTLB-store-misses,L1-dcache-load-misses,LLC-loads,LLC-load-misses $BIN 2>&1 | grep -vE "^$"
