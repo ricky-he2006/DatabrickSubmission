@@ -337,11 +337,23 @@ impl Keys {
             if bytes & 0x8080808080808080 == 0
                 && (bytes.wrapping_sub(0x0101010101010101) & !bytes & 0x8080808080808080) == 0
             {
-                let pairs = (bytes & 0x007f007f007f007f) | ((bytes >> 1) & 0x3f803f803f803f80);
-                let quads = (pairs & 0x00003fff00003fff) | ((pairs >> 2) & 0x0fffc0000fffc000);
-                return (u64::from(value[0]) << 56)
-                    | (quads & 0x0fffffff)
-                    | ((quads >> 4) & 0x00fffffff0000000);
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                {
+                    // PEXT keeps seven bits per byte, in the same order as the
+                    // portable shifts. The release's x86-64-v3 target has BMI2.
+                    let packed = unsafe {
+                        std::arch::x86_64::_pext_u64(bytes, 0x7f7f_7f7f_7f7f_7f7f)
+                    };
+                    return (u64::from(value[0]) << 56) | packed;
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                {
+                    let pairs = (bytes & 0x007f007f007f007f) | ((bytes >> 1) & 0x3f803f803f803f80);
+                    let quads = (pairs & 0x00003fff00003fff) | ((pairs >> 2) & 0x0fffc0000fffc000);
+                    return (u64::from(value[0]) << 56)
+                        | (quads & 0x0fffffff)
+                        | ((quads >> 4) & 0x00fffffff0000000);
+                }
             }
         }
         if value.len() <= 9 && value.iter().all(|&b| b > 0 && b < 128) {
