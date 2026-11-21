@@ -1,7 +1,4 @@
-cur|cur|
-m0|modes|SS_MODE=0
-m1|modes|SS_MODE=1
-m2|modes|SS_MODE=2
-1:m0|modes|NCPU=1 SS_MODE=0
-1:m1|modes|NCPU=1 SS_MODE=1
-1:m2|modes|NCPU=1 SS_MODE=2
+base|base|
+split|split|
+1:base|base|NCPU=1
+1:split|split|NCPU=1
