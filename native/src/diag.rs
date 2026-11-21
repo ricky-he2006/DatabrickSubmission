@@ -223,6 +223,20 @@ pub fn run() -> ! {
         touch(256, 8, 23)
     ));
     head.push(format!("ms from container created to our main: {created:.0}"));
+    // How fast do plain writes to each place go, and does size change the rate?
+    let mut writes = Vec::new();
+    for folder in ["/output", "/scratch"] {
+        for megabytes in [4usize, 32, 128] {
+            let path = format!("{folder}/.diag-write");
+            let block = vec![7u8; megabytes << 20];
+            let began = Instant::now();
+            let ok = fs::write(&path, &block).is_ok();
+            let took = began.elapsed().as_secs_f64() * 1000.0;
+            let _ = fs::remove_file(&path);
+            writes.push(format!("{folder} {megabytes}MB={took:.0}{}", if ok { "" } else { "!" }));
+        }
+    }
+    head.push(format!("write ms: {}", writes.join(" ")));
     for line in &head {
         eprintln!("{line}");
     }
@@ -240,28 +254,20 @@ pub fn run() -> ! {
     let variants: Vec<(&str, Vec<(&'static str, String)>)> = vec![
         ("dev", vec![]),
         ("base", scaled(&[])),
+        ("nowrite", scaled(&[("SS_NOWRITE", "1")])),
+        ("to-scratch", scaled(&[("OUTPUT_DIR", "/scratch/out")])),
+        ("to-tmp", vec![("OUTPUT_DIR", "/tmp/out".to_string())]),
+        ("base", scaled(&[])),
+        ("nowrite", scaled(&[("SS_NOWRITE", "1")])),
         ("huge0", scaled(&[("SS_HUGE", "0")])),
-        ("pop1", scaled(&[("SS_POPULATE", "1")])),
-        ("pop1huge0", scaled(&[("SS_POPULATE", "1"), ("SS_HUGE", "0")])),
-        ("map0", scaled(&[("SS_MAP", "0")])),
         ("rel0", scaled(&[("SS_RELEASE", "0")])),
-        ("blk256k", scaled(&[("SS_BLOCK", "262144")])),
-        ("blk1m", scaled(&[("SS_BLOCK", "1048576")])),
-        ("blk4m", scaled(&[("SS_BLOCK", "4194304")])),
-        ("id9", scaled(&[("SS_ID_BITS", "9")])),
-        ("id10", scaled(&[("SS_ID_BITS", "10")])),
-        ("id12", scaled(&[("SS_ID_BITS", "12")])),
-        ("id13", scaled(&[("SS_ID_BITS", "13")])),
-        ("pb9", scaled(&[("SS_PERSON_BITS", "9")])),
+        ("map0", scaled(&[("SS_MAP", "0")])),
         ("pb10", scaled(&[("SS_PERSON_BITS", "10")])),
-        ("pb12", scaled(&[("SS_PERSON_BITS", "12")])),
-        ("pb13", scaled(&[("SS_PERSON_BITS", "13")])),
-        ("ahead8", scaled(&[("SS_AHEAD", "8")])),
-        ("ahead32", scaled(&[("SS_AHEAD", "32")])),
-        ("ahead64", scaled(&[("SS_AHEAD", "64")])),
+        ("id10pb10", scaled(&[("SS_ID_BITS", "10"), ("SS_PERSON_BITS", "10")])),
         ("ncpu1", scaled(&[("NCPU", "1")])),
+        ("ncpu2", scaled(&[("NCPU", "2")])),
         ("ncpu4", scaled(&[("NCPU", "4")])),
-        ("ncpu6", scaled(&[("NCPU", "6")])),
+        ("ncpu10", scaled(&[("NCPU", "10")])),
         ("ncpu12", scaled(&[("NCPU", "12")])),
         ("ncpu16", scaled(&[("NCPU", "16")])),
         (
