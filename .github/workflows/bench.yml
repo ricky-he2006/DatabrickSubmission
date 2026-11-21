@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 jobs:
   bench:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -95,7 +96,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        copy: [1]
+        copy: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:

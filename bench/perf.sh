@@ -12,7 +12,12 @@ RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 BIN=/tmp/p/native/target/release/shopping-sessions
 run() { rm -rf /dev/shm/out/*; env DATA_DIR=/dev/shm/d20 OUTPUT_DIR=/dev/shm/out NCPU=4 "$@"; }
 for i in 1 2 3; do run $BIN; done
-run $PERF stat -e task-clock,cycles,instructions,page-faults,context-switches $BIN 2>&1 | grep -vE "^$"
+run $PERF stat -e task-clock,cycles,instructions,page-faults,branches,branch-misses $BIN 2>&1 | grep -vE "^$"
+run $PERF stat -d -d $BIN 2>&1 | grep -vE "^$"
+run $PERF stat -e dTLB-loads,dTLB-load-misses,dTLB-stores,dTLB-store-misses,L1-dcache-load-misses,LLC-loads,LLC-load-misses $BIN 2>&1 | grep -vE "^$"
+run $PERF record -q -e branch-misses -c 2000 -o /tmp/bm.data $BIN
+echo "=== branch misses by line"; $PERF report -i /tmp/bm.data --no-children --sort srcline --stdio --percent-limit 1 2>/dev/null | grep -vE "^#|^$" | head -40
+run $PERF record -q -e LLC-load-misses -c 2000 -o /tmp/llc.data $BIN 2>/dev/null && { echo "=== LLC misses by line"; $PERF report -i /tmp/llc.data --no-children --sort srcline --stdio --percent-limit 1 2>/dev/null | grep -vE "^#|^$" | head -40; }
 EV=cycles; $PERF stat -e cycles true >/dev/null 2>&1 || EV=cpu-clock
 run $PERF record -q -e $EV -F 9999 -o /tmp/perf.data $BIN
 $PERF report -i /tmp/perf.data --no-children --sort sym --stdio --percent-limit 0.3 2>/dev/null > /tmp/sym.txt
