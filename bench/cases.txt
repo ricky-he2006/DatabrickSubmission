@@ -1,4 +1,5 @@
 base|base|
-links|links|
+chunks|chunks|
+chunks10|chunks|SS_ID_BITS=10 SS_PERSON_BITS=10
 1:base|base|NCPU=1
-1:links|links|NCPU=1
+1:chunks|chunks|NCPU=1
