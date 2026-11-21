@@ -79,6 +79,21 @@ impl Source {
     }
 }
 
+/// How many bytes ahead of the scan to prefetch input (0 = off). The input is
+/// mapped in 4 KB pages and hardware prefetchers stop at each page's end.
+pub static READ_AHEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+fn fetch(target: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch(target as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = target;
+}
+
 pub struct Block {
     buf: Vec<u8>,
     /// Where offsets count from: the block's first byte.
@@ -254,7 +269,11 @@ impl Block {
         // right before it, which needs the quotes of the words on either side.
         let mut carried = 0u64;
         let mut ahead = if most > 0 { unsafe { masks(data) } } else { (0, 0, 0) };
+        let read_ahead = READ_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
         while word < most {
+            if read_ahead != 0 {
+                fetch(data.wrapping_add(word * 64 + read_ahead));
+            }
             let (commas, newlines, quote) = ahead;
             ahead = if word + 1 < most {
                 unsafe { masks(data.add((word + 1) * 64)) }

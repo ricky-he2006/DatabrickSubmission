@@ -1386,6 +1386,7 @@ fn main() -> io::Result<()> {
         diag::run();
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
+    scan::READ_AHEAD.store(tune("SS_READ_AHEAD", 0) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
     let map = tune("SS_MAP", 1) != 0;

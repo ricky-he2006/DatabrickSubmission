@@ -69,6 +69,21 @@ impl Source {
     }
 }
 
+/// How many bytes ahead of the scan to prefetch input (0 = off). The input is
+/// mapped in 4 KB pages and hardware prefetchers stop at each page's end.
+pub static READ_AHEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+fn fetch(target: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch(target as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = target;
+}
+
 pub struct Block {
     buf: Vec<u8>,
     base: *const u8,
@@ -211,7 +226,12 @@ impl Block {
             let Some(mut newline) = head.iter().position(|&byte| byte == b'\n') else {
                 return;
             };
+            let read_ahead = READ_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
             while newline < own_end && newline + 1 < end {
+                if read_ahead != 0 {
+                    fetch(buf.wrapping_add(newline + read_ahead));
+                    fetch(buf.wrapping_add(newline + read_ahead + 64));
+                }
                 let mut fields = [(0u32, 0u32); N];
                 let mut count = 0usize;
                 let mut ok = true;
