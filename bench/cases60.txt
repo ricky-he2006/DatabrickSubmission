@@ -1,5 +1,5 @@
 base|base|
-new|new|
-huge0|new|SS_HUGE=0
-map0|new|SS_MAP=0
-rel0|new|SS_RELEASE=0
+kts|kts|
+id12pb12|kts|SS_ID_BITS=12 SS_PERSON_BITS=12
+id13pb12|kts|SS_ID_BITS=13 SS_PERSON_BITS=12
+1:base|base|NCPU=1

@@ -5,7 +5,7 @@ set -u
 ROOT=$(pwd)
 export RUSTFLAGS="-C target-cpu=x86-64-v3"
 D=${DATA:-d20}; CASES=${CASES:-bench/cases.txt}
-mkdir -p /dev/shm/$D /dev/shm/out && cp -r data-cache/$D/. /dev/shm/$D/
+mkdir -p /dev/shm/$D /dev/shm/out && cp -r data-cache/$D/. /dev/shm/$D/ && find data-cache/$D -type f -exec dd if={} iflag=nocache count=0 status=none \; ; free -m | head -2
 git worktree add -q /tmp/base origin/a 2>/dev/null || true
 (cd /tmp/base/native && cargo build --release 2>&1 | tail -1)
 (cd "$ROOT/native" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8; cargo build --release 2>&1 | tail -1)
