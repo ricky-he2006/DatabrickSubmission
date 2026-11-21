@@ -1,6 +1,6 @@
 [package]
 name = "shopping-sessions"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 
@@ -8,11 +8,16 @@ rust-version = "1.85"
 memmap2 = "=0.9.5"
 memchr = "=2.7.4"
 rayon = "=1.10.0"
-
 serde_json = "=1.0.140"
-parquet = {version="=54.3.1",default-features=false}
+parquet = { version = "=54.3.1", default-features = false }
+rustc-hash = "=2.1.1"          # FxHashMap: 1.7x faster than ahash on u64 keys
+mimalloc = { version = "=0.1.46", default-features = false }
+voracious_radix_sort = "=1.2.0" # parallel radix sort for integer tuples
+atoi_simd = "=1.0.0"            # SIMD integer parsing on AVX2 / AVX-512
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true
+opt-level = 3
