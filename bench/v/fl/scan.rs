@@ -443,9 +443,9 @@ impl Block {
             let mut kept = 0usize;
             let mut line = first as u32 + 1;
             let mut at = line;
-            // 1 while a field that opened with a quote has its closing
-            // separator still to come.
-            let mut carry = u64::from(*buf.add(line as usize) == b'"');
+            // 1 while a field that opened with a quote in an earlier chunk has
+            // its closing separator still to come.
+            let mut carry = 0u64;
             while at < end {
                 if seps.capacity() < kept + WINDOW * 64 + 128 {
                     // The separators kept from the last window move with the buffer.
@@ -482,12 +482,16 @@ impl Block {
                         // The separator ending each field that opened with a quote,
                         // found by a carry through the run of non-separators after
                         // it; it must be a separator right after a closing quote.
-                        let opens = sep & quote_after;
+                        // A field opening at the chunk's first byte counts here,
+                        // not in the chunk before: that one may have skipped
+                        // these checks for having no quotes.
+                        let opens = sep & quote_after & !(1u64 << 63);
+                        let first_opens = opening & 1;
                         let (sum, over) = (!sep).overflowing_add(opens << 1);
-                        let (sum, over2) = sum.overflowing_add(carry);
+                        let (sum, over2) = sum.overflowing_add(carry | first_opens);
                         let closes = sum & sep;
                         wrong |= closes ^ (sep & quote_before);
-                        carry = u64::from(over | over2) | (opens >> 63);
+                        carry = u64::from(over | over2);
                         if wrong != 0 {
                             bad.push(at);
                         }
@@ -530,6 +534,38 @@ impl Block {
                 std::ptr::copy(out.add(sep_at), out, kept);
             }
         }
+    }
+
+    /// Floor experiments: 6 reads one byte per 64, 4 classifies every chunk,
+    /// 5 also writes out separator positions.
+    pub fn floor(&self, mode: usize) -> u64 {
+        let buf = self.base;
+        let end = self.own_end.min(self.end);
+        let mut total = 0u64;
+        let mut seps = vec![0u32; 4096 + 128];
+        let mut count = 0usize;
+        unsafe {
+            let mut at = 0usize;
+            while at < end {
+                let p = buf.add(at);
+                fetch(p.wrapping_add(READ_AHEAD));
+                if mode == 6 {
+                    total += *p as u64;
+                } else {
+                    let (sep, newline, quote) = classes(p);
+                    total += (newline.count_ones() + quote.count_ones()) as u64;
+                    if mode == 5 {
+                        count += flatten::<10>(sep, at as u32, seps.as_mut_ptr().add(count));
+                        if count > 4096 {
+                            total += seps[count - 1] as u64;
+                            count = 0;
+                        }
+                    }
+                }
+                at += 64;
+            }
+        }
+        total
     }
 
     /// `raw_lines`, with every field's bounds worked out and unquoted.
@@ -679,14 +715,15 @@ mod tests {
                         1 => 60 + next() % 90,
                         _ => next() % 14,
                     };
+                    let rare = round % 3 == 0;
                     let mut value: Vec<u8> = (0..len)
-                        .map(|_| match next() % 30 {
+                        .map(|_| match next() % if rare { 3000 } else { 30 } {
                             0 => b'"',
                             1 => b'\r',
                             _ => b'a' + (next() % 26) as u8,
                         })
                         .collect();
-                    match next() % 6 {
+                    match next() % if rare { 60 } else { 6 } {
                         0 | 1 => {
                             value.insert(0, b'"');
                             value.push(b'"');
@@ -706,5 +743,56 @@ mod tests {
                 check::<4>(&text, text.len());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod real_files {
+    use super::*;
+
+    fn compare<const N: usize>(path: &std::path::Path, block_size: u64) -> usize {
+        let source = Source::open(path, true).unwrap();
+        let mut block = Block::new();
+        let mut bad = 0;
+        let mut start = 0;
+        while start < source.size {
+            let end = (start + block_size).min(source.size);
+            block.load(&source, start, end).unwrap();
+            let grab = |slow: bool| {
+                let mut out: Vec<Vec<Vec<u8>>> = Vec::new();
+                let mut take = |buf: *const u8, fields: &[(u32, u32); N]| {
+                    out.push(fields.iter().map(|&(a, b)| unsafe {
+                        std::slice::from_raw_parts(buf.add(a as usize), (b - a) as usize).to_vec()
+                    }).collect());
+                };
+                if slow { block.lines_slow::<N>(&mut take) } else { block.lines::<N>(&mut take) }
+                out
+            };
+            let (fast, slow) = (grab(false), grab(true));
+            if fast != slow {
+                bad += 1;
+                let only_fast: Vec<_> = fast.iter().filter(|l| !slow.contains(l)).take(3).collect();
+                let only_slow: Vec<_> = slow.iter().filter(|l| !fast.contains(l)).take(3).collect();
+                eprintln!("{} @{}: fast {} slow {}", path.display(), start, fast.len(), slow.len());
+                for l in only_fast { eprintln!("  fast only: {:?}", l.iter().map(|f| String::from_utf8_lossy(f).to_string()).collect::<Vec<_>>()); }
+                for l in only_slow { eprintln!("  slow only: {:?}", l.iter().map(|f| String::from_utf8_lossy(f).to_string()).collect::<Vec<_>>()); }
+            }
+            start = end;
+        }
+        bad
+    }
+
+    #[test]
+    fn real_data() {
+        let Ok(dir) = std::env::var("SCAN_DIR") else { return };
+        let mut bad = 0;
+        for (folder, n) in [("events", 7), ("clicks", 4)] {
+            let mut paths: Vec<_> = std::fs::read_dir(format!("{dir}/{folder}")).unwrap().map(|e| e.unwrap().path()).collect();
+            paths.sort();
+            for path in paths {
+                bad += if n == 7 { compare::<7>(&path, 1 << 19) } else { compare::<4>(&path, 1 << 19) };
+            }
+        }
+        assert_eq!(bad, 0);
     }
 }
