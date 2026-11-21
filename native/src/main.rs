@@ -847,8 +847,12 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         let mask = capacity - 1;
         table.clear();
         table.resize(capacity, NONE);
+        let abl = ABL.load(Ordering::Relaxed);
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
+                if abl & 1024 != 0 {
+                    break;
+                }
                 for offset in 0..count {
                     let record = base.add(offset);
                     let id = (*record).id;
@@ -886,7 +890,7 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let person = if abl & 2048 != 0 { record.user } else { links.person(record.user) };
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
@@ -1211,8 +1215,11 @@ fn session_worker(
 
         // The clicks of the people who have events, grouped the same way.
         click_chunks.clear();
-        for source in clicks {
-            source.chunks(part, &mut click_chunks);
+        let abl = ABL.load(Ordering::Relaxed);
+        if abl & 512 == 0 {
+            for source in clicks {
+                source.chunks(part, &mut click_chunks);
+            }
         }
         click_ends.clear();
         click_ends.resize(persons.len(), 0);
@@ -1280,7 +1287,8 @@ fn session_worker(
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
-            if mine.len() > 2048 {
+            if abl & 128 != 0 {
+            } else if mine.len() > 2048 {
                 sort_by_time(mine, &mut scratch);
             } else {
                 mine.sort_unstable();
@@ -1289,7 +1297,11 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
             }
-            sessions.person(person, mine, reached)?;
+            if abl & 256 != 0 {
+                sessions.totals[0][0] += mine.len() as u64 + reached.len() as u64;
+            } else {
+                sessions.person(person, mine, reached)?;
+            }
             from = to;
             click_from = click_to;
         }
