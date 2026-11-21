@@ -760,6 +760,14 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
+                    if offset + 8 < count {
+                        let next_id = (*base.add(offset + 8)).id;
+                        let next_slot = (next_id.wrapping_mul(MIX) >> 24) as usize & mask;
+                        #[cfg(target_arch = "x86_64")]
+                        core::arch::x86_64::_mm_prefetch(table.as_ptr().add(next_slot) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+                        #[cfg(not(target_arch = "x86_64"))]
+                        prefetch(table.get_unchecked(next_slot));
+                    }
                     let record = base.add(offset);
                     let id = (*record).id;
                     let entry = ((index << 8) | offset) as u32;

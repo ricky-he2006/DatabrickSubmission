@@ -16,6 +16,11 @@ unsafe fn load32(p: *const u8) -> u32 {
 }
 
 #[inline(always)]
+unsafe fn load16(p: *const u8) -> u16 {
+    unsafe { u16::from_le((p as *const u16).read_unaligned()) }
+}
+
+#[inline(always)]
 fn byte(x: u64, at: u32) -> i64 {
     ((x >> (at * 8)) & 0xFF) as i64
 }
@@ -35,14 +40,14 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
     month: [u64; 100],
-    days: [i64; 100],
+    day_seconds: [i64; 100],
 }
 
 impl Dates {
     pub fn new() -> Self {
         Self {
             month: [0; 100],
-            days: [0; 100],
+            day_seconds: [0; 100],
         }
     }
 }
@@ -89,18 +94,19 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
             return BAD;
         }
         let slot = day as usize;
-        let days = if *dates.month.get_unchecked(slot) == raw {
-            *dates.days.get_unchecked(slot)
+        let day_sec = if *dates.month.get_unchecked(slot) == raw {
+            *dates.day_seconds.get_unchecked(slot)
         } else {
             let days = civil_day(raw, day);
             if days == BAD {
                 return BAD;
             }
+            let sec = days * 86_400;
             dates.month[slot] = raw;
-            dates.days[slot] = days;
-            days
+            dates.day_seconds[slot] = sec;
+            sec
         };
-        days * 86_400 + hour * 3_600 + minute * 60 + second
+        day_sec + hour * 3_600 + minute * 60 + second
     }
 }
 
@@ -137,18 +143,19 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
         let second = ((sums & 0xFFFF_FFFF) + (sums >> 32)) as i64;
         let day = (_mm_cvtsi128_si32(parts) & 0xFFFF) as i64;
         let slot = day as usize;
-        let days = if *dates.month.get_unchecked(slot) == raw {
-            *dates.days.get_unchecked(slot)
+        let day_sec = if *dates.month.get_unchecked(slot) == raw {
+            *dates.day_seconds.get_unchecked(slot)
         } else {
             let days = civil_day(raw, day);
             if days == BAD {
                 return BAD;
             }
+            let sec = days * 86_400;
             dates.month[slot] = raw;
-            dates.days[slot] = days;
-            days
+            dates.day_seconds[slot] = sec;
+            sec
         };
-        days * 86_400 + second
+        day_sec + second
     }
 }
 
@@ -244,13 +251,10 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
-/// A purchase price: digits only, 1 to 10,000,000. 0 if it is not one.
-#[inline(always)]
-pub unsafe fn price(p: *const u8, len: usize) -> u32 {
+#[cold]
+#[inline(never)]
+unsafe fn price_slow(p: *const u8, len: usize) -> u32 {
     unsafe {
-        if len == 0 {
-            return 0;
-        }
         let mut value: u64 = 0;
         for at in 0..len {
             let digit = (*p.add(at)).wrapping_sub(b'0');
@@ -266,6 +270,31 @@ pub unsafe fn price(p: *const u8, len: usize) -> u32 {
     }
 }
 
+/// A purchase price: digits only, 1 to 10,000,000. 0 if it is not one.
+#[inline(always)]
+pub unsafe fn price(p: *const u8, len: usize) -> u32 {
+    unsafe {
+        if len == 0 {
+            return 0;
+        }
+        if len > 8 {
+            return price_slow(p, len);
+        }
+        let raw = load64(p);
+        let t = raw ^ 0x3030_3030_3030_3030;
+        let shift = (8 - len) * 8;
+        let t_shifted = t << shift;
+        if not_digits(t_shifted) != 0 {
+            return 0;
+        }
+        let value = eight_digits(t_shifted);
+        if value == 0 || value > 10_000_000 {
+            return 0;
+        }
+        value as u32
+    }
+}
+
 /// `prefix` then 1 to 7 digits with no leading zero: the number, else `usize::MAX`.
 #[inline(always)]
 pub unsafe fn numbered(p: *const u8, len: usize, prefix: &[u8]) -> usize {
@@ -274,23 +303,33 @@ pub unsafe fn numbered(p: *const u8, len: usize, prefix: &[u8]) -> usize {
         if len <= skip || len > skip + 7 {
             return usize::MAX;
         }
-        for (at, &expected) in prefix.iter().enumerate() {
-            if *p.add(at) != expected {
+        if skip == 1 {
+            if *p != *prefix.get_unchecked(0) {
                 return usize::MAX;
+            }
+        } else if skip == 2 {
+            if load16(p) != u16::from_le_bytes([*prefix.get_unchecked(0), *prefix.get_unchecked(1)]) {
+                return usize::MAX;
+            }
+        } else {
+            for (at, &expected) in prefix.iter().enumerate() {
+                if *p.add(at) != expected {
+                    return usize::MAX;
+                }
             }
         }
         if *p.add(skip) == b'0' {
             return usize::MAX;
         }
-        let mut value = 0usize;
-        for at in skip..len {
-            let digit = (*p.add(at)).wrapping_sub(b'0');
-            if digit > 9 {
-                return usize::MAX;
-            }
-            value = value * 10 + digit as usize;
+        let digits_len = len - skip;
+        let raw = load64(p.add(skip));
+        let t = raw ^ 0x3030_3030_3030_3030;
+        let shift = (8 - digits_len) * 8;
+        let t_shifted = t << shift;
+        if not_digits(t_shifted) != 0 {
+            return usize::MAX;
         }
-        value
+        eight_digits(t_shifted) as usize
     }
 }
 
