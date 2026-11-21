@@ -1,2 +1,4 @@
-cur|cur|
 1:tim|tim|NCPU=1
+1:nolink|nolink|NCPU=1
+tim|tim|
+nolink|nolink|

@@ -412,6 +412,8 @@ pub fn huge<T>(start: *const T, count: usize) {
 /// Tunables the diagnostic run flips; the defaults are what a scored run uses.
 pub static HUGE: AtomicUsize = AtomicUsize::new(1);
 /// How long the one thread that builds the links table spent on it.
+static T: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+fn tick(at: usize, from: Instant) { T[at].fetch_add(from.elapsed().as_nanos() as usize, Ordering::Relaxed); }
 static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
 pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
 
@@ -750,6 +752,7 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         if total == 0 {
             continue;
         }
+        let d0 = Instant::now();
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
@@ -784,20 +787,20 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     }
                 }
             }
+            tick(0, d0);
+            let d1 = Instant::now();
             for &(base, count) in &chunks {
                 for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
+                    let person = record.user;
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
+            tick(1, d1);
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
@@ -1044,6 +1047,7 @@ fn session_worker(
             continue;
         }
 
+        let s0 = Instant::now();
         // Group the events by person: number the people as they appear.
         let mut capacity = (total / 4 + 16).next_power_of_two();
         let mut mask = capacity - 1;
@@ -1116,6 +1120,8 @@ fn session_worker(
             }
         }
 
+        tick(2, s0);
+        let s1 = Instant::now();
         // The clicks of the people who have events, grouped the same way.
         click_chunks.clear();
         for source in clicks {
@@ -1182,10 +1188,12 @@ fn session_worker(
             }
         }
 
+        tick(3, s1);
         let (mut from, mut click_from) = (0usize, 0usize);
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
+            let s2 = Instant::now();
             let mine = &mut values[from..to];
             if mine.len() > 2048 {
                 sort_by_time(mine, &mut scratch);
@@ -1196,7 +1204,10 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
             }
+            tick(4, s2);
+            let s3 = Instant::now();
             sessions.person(person, mine, reached)?;
+            tick(5, s3);
             from = to;
             click_from = click_to;
         }
@@ -1485,6 +1496,8 @@ fn main() -> io::Result<()> {
         LINKS_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
         total.as_secs_f64()
     );
+    let t = |i: usize| T[i].load(Ordering::Relaxed) as f64 / 1e9;
+    eprintln!("dedup1={:.3} dedup2={:.3} group={:.3} clicks={:.3} sort={:.3} person={:.3}", t(0), t(1), t(2), t(3), t(4), t(5));
     // Everything left is memory the kernel frees faster than we can.
     std::process::exit(0);
 }
