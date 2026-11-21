@@ -1,8 +1,11 @@
 base|base|
-basesky|basesky|
-new|new|
-has|has|
-sky|sky|
+k|k|
+t|t|
+s|s|
+kt|kt|
+kts|kts|
 1:base|base|NCPU=1
-1:new|new|NCPU=1
-1:sky|sky|NCPU=1
+1:k|k|NCPU=1
+1:t|t|NCPU=1
+1:s|s|NCPU=1
+1:kts|kts|NCPU=1
