@@ -272,6 +272,10 @@ struct Links {
     slots: Vec<[u64; 2]>,
     shift: u32,
     empty: bool,
+    /// One bit per hash of every ID in `slots`, small enough to stay in cache:
+    /// most IDs that no link names are answered here, without touching `slots`.
+    filter: Vec<u64>,
+    filter_shift: u32,
 }
 
 impl Links {
@@ -355,23 +359,49 @@ impl Links {
                 entry[1] = smallest[find(&mut parent, entry[1] as u32) as usize];
             }
         }
+        // At 8 bits per ID or more, one in eight IDs that no link names gets past.
+        let filter_bits = (names.len() * FILTER.load(Ordering::Relaxed)).next_power_of_two().max(64);
+        let filter_shift = 64 - filter_bits.trailing_zeros();
+        let mut filter = vec![0u64; filter_bits / 64];
+        for &name in &names {
+            let bit = Self::filter_bit(name, filter_shift);
+            filter[bit / 64] |= 1 << (bit % 64);
+        }
         Self {
             slots,
             shift,
             empty: pairs.is_empty(),
+            filter,
+            filter_shift,
         }
+    }
+
+    /// The filter bit of `key`: another hash than the slot's.
+    #[inline(always)]
+    fn filter_bit(key: u64, shift: u32) -> usize {
+        ((key ^ (key >> 29)).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift) as usize
+    }
+
+    /// Whether `key` may be in `slots`.
+    #[inline(always)]
+    fn may_hold(&self, key: u64) -> bool {
+        if self.filter.len() == 1 {
+            return true;
+        }
+        let bit = Self::filter_bit(key, self.filter_shift);
+        unsafe { (*self.filter.get_unchecked(bit / 64) >> (bit % 64)) & 1 != 0 }
     }
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
-        if !self.empty {
+        if !self.empty && self.may_hold(key) {
             prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
         }
     }
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
-        if self.empty {
+        if self.empty || !self.may_hold(key) {
             return key;
         }
         let mask = self.slots.len() - 1;
@@ -412,9 +442,9 @@ pub fn huge<T>(start: *const T, count: usize) {
 /// Tunables the diagnostic run flips; the defaults are what a scored run uses.
 pub static HUGE: AtomicUsize = AtomicUsize::new(1);
 /// How long the one thread that builds the links table spent on it.
-static T: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
-fn tick(at: usize, from: Instant) { T[at].fetch_add(from.elapsed().as_nanos() as usize, Ordering::Relaxed); }
 static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
+/// Bits of the links filter per linked ID.
+pub static FILTER: AtomicUsize = AtomicUsize::new(8);
 pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
 
 /// With `POPULATE` on: when `count` values at `start` begin a new 2 MB stretch,
@@ -752,7 +782,6 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         if total == 0 {
             continue;
         }
-        let d0 = Instant::now();
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
@@ -787,20 +816,20 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     }
                 }
             }
-            tick(0, d0);
-            let d1 = Instant::now();
             for &(base, count) in &chunks {
                 for offset in 0..count {
+                    if offset + ahead < count {
+                        links.prefetch((*base.add(offset + ahead)).user);
+                    }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = record.user;
+                    let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
-            tick(1, d1);
             // Every record of this bucket has been read: its chunks are free.
             for &(base, _) in &chunks {
                 out.donate(base as *mut u8);
@@ -1047,7 +1076,6 @@ fn session_worker(
             continue;
         }
 
-        let s0 = Instant::now();
         // Group the events by person: number the people as they appear.
         let mut capacity = (total / 4 + 16).next_power_of_two();
         let mut mask = capacity - 1;
@@ -1120,8 +1148,6 @@ fn session_worker(
             }
         }
 
-        tick(2, s0);
-        let s1 = Instant::now();
         // The clicks of the people who have events, grouped the same way.
         click_chunks.clear();
         for source in clicks {
@@ -1188,12 +1214,10 @@ fn session_worker(
             }
         }
 
-        tick(3, s1);
         let (mut from, mut click_from) = (0usize, 0usize);
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
-            let s2 = Instant::now();
             let mine = &mut values[from..to];
             if mine.len() > 2048 {
                 sort_by_time(mine, &mut scratch);
@@ -1204,10 +1228,7 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
             }
-            tick(4, s2);
-            let s3 = Instant::now();
             sessions.person(person, mine, reached)?;
-            tick(5, s3);
             from = to;
             click_from = click_to;
         }
@@ -1235,6 +1256,7 @@ fn main() -> io::Result<()> {
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
+    FILTER.store(tune("SS_FILTER", 8) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
     let map = tune("SS_MAP", 1) != 0;
     let give_back = tune("SS_RELEASE", 1) != 0;
@@ -1496,8 +1518,6 @@ fn main() -> io::Result<()> {
         LINKS_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
         total.as_secs_f64()
     );
-    let t = |i: usize| T[i].load(Ordering::Relaxed) as f64 / 1e9;
-    eprintln!("dedup1={:.3} dedup2={:.3} group={:.3} clicks={:.3} sort={:.3} person={:.3}", t(0), t(1), t(2), t(3), t(4), t(5));
     // Everything left is memory the kernel frees faster than we can.
     std::process::exit(0);
 }

@@ -1,4 +1,7 @@
-1:tim|tim|NCPU=1
-1:nolink|nolink|NCPU=1
-tim|tim|
-nolink|nolink|
+cur|cur|
+filt0|filt|SS_FILTER=0
+filt8|filt|SS_FILTER=8
+filt16|filt|SS_FILTER=16
+filt4|filt|SS_FILTER=4
+1:cur|cur|NCPU=1
+1:filt8|filt|NCPU=1 SS_FILTER=8
