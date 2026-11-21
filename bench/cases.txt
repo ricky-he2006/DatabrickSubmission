@@ -1,5 +1,7 @@
 base|base|
-chunks|chunks|
-chunks10|chunks|SS_ID_BITS=10 SS_PERSON_BITS=10
-1:base|base|NCPU=1
-1:chunks|chunks|NCPU=1
+cur|cur|
+ahead8|cur|SS_AHEAD=8
+ahead32|cur|SS_AHEAD=32
+ahead64|cur|SS_AHEAD=64
+blk256k|cur|SS_BLOCK=262144
+blk1m|cur|SS_BLOCK=1048576

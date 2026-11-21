@@ -35,8 +35,8 @@ const BLOCK: u64 = 1 << 19;
 const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
-const ID_BITS: u32 = 11;
-const PERSON_BITS: u32 = 11;
+const ID_BITS: u32 = 10;
+const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
