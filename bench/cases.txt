@@ -1,9 +1,4 @@
-split3|split3|
-m1|modes3|SS_MODE=1
-m3|modes3|SS_MODE=3
-id6|split3|SS_ID_BITS=6
-id8|split3|SS_ID_BITS=8
-id12|split3|SS_ID_BITS=12
-1:split3|split3|NCPU=1
-1:m1|modes3|NCPU=1 SS_MODE=1
-1:m3|modes3|NCPU=1 SS_MODE=3
+base|base|
+resolve|resolve|
+1:base|base|NCPU=1
+1:resolve|resolve|NCPU=1
