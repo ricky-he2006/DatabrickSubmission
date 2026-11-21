@@ -9,6 +9,10 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
