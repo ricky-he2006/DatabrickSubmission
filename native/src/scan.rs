@@ -98,7 +98,23 @@ pub struct Block {
     end: usize,
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn window(p: *const u8) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    // Block::load guarantees readable padding beyond the last newline:
+    // either mapped slack or zeroed buffer bytes. This is the same
+    // 64-byte read range as the AVX2 and NEON implementations.
+    unsafe {
+        let input = _mm512_loadu_si512(p.cast());
+        let commas = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(b',' as i8));
+        let newlines = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(b'\n' as i8));
+        let quotes = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(b'"' as i8));
+        (commas | newlines, quotes)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn window(p: *const u8) -> (u64, u64) {
     unsafe {
