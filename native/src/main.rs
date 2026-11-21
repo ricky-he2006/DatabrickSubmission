@@ -1298,7 +1298,7 @@ fn session_worker(
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
             }
             if abl & 256 != 0 {
-                sessions.totals[0][0] += mine.len() as u64 + reached.len() as u64;
+                sessions.totals[0][0] += (mine.len() + reached.len()) as i64;
             } else {
                 sessions.person(person, mine, reached)?;
             }
