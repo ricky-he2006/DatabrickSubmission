@@ -15,7 +15,7 @@ for i in 1 2 3; do run $BIN; done
 run $PERF stat -e task-clock,cycles,instructions,page-faults,context-switches $BIN 2>&1 | grep -vE "^$"
 EV=cycles; $PERF stat -e cycles true >/dev/null 2>&1 || EV=cpu-clock
 run $PERF record -q -e $EV -F 9999 -o /tmp/perf.data $BIN
-echo "=== by symbol"
-$PERF report -i /tmp/perf.data --no-children --sort sym --stdio 2>/dev/null | grep -vE "^#|^$" | head -30
-echo "=== by source line"
-$PERF report -i /tmp/perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -vE "^#|^$" | head -150
+$PERF report -i /tmp/perf.data --no-children --sort sym --stdio --percent-limit 0.3 2>/dev/null > /tmp/sym.txt
+$PERF report -i /tmp/perf.data --no-children --sort srcline --stdio --percent-limit 0.15 2>/dev/null > /tmp/line.txt
+echo "=== by symbol"; grep -vE "^#|^$" /tmp/sym.txt | cut -c1-160
+echo "=== by source line"; grep -vE "^#|^$" /tmp/line.txt

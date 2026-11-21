@@ -1,6 +1,9 @@
 base|base|
-pgo|pgo|
-v4|v4|
-pgov4|pgov4|
+id10|base|SS_ID_BITS=10
+id9|base|SS_ID_BITS=9
+pb10|base|SS_PERSON_BITS=10
+pb9|base|SS_PERSON_BITS=9
+id10pb10|base|SS_ID_BITS=10 SS_PERSON_BITS=10
+pop|base|SS_POPULATE=1
 1:base|base|NCPU=1
-1:pgo|pgo|NCPU=1
+1:id10pb10|base|NCPU=1 SS_ID_BITS=10 SS_PERSON_BITS=10
