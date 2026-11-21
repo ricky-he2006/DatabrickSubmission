@@ -35,8 +35,8 @@ const BLOCK: u64 = 1 << 19;
 const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
-const ID_BITS: u32 = 11;
-const PERSON_BITS: u32 = 11;
+const ID_BITS: u32 = 10;
+const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
@@ -47,33 +47,32 @@ const AHEAD: usize = 16;
 
 // ---------------------------------------------------------------- buckets
 
-/// Records per chunk. The dedup table packs a record's offset in its chunk into 8 bits.
-const CHUNK: usize = 256;
-const _: () = assert!(CHUNK == 256);
+/// Bytes per chunk. Chunks are aligned to their size, so a partition's write
+/// position alone says when its chunk is full: the hot state of a partition is
+/// one pointer, and 2048 of them stay in the L1 cache.
+const CHUNK_BYTES: usize = 8192;
+/// Chunks per slab.
 const SLAB: usize = 1 << 13;
-
-struct Part<T> {
-    next: *mut T,
-    end: *mut T,
-    head: u32,
-    chunks: u32,
-}
+/// The dedup table packs a record's offset in its chunk into this many bits.
+const OFFSET_BITS: u32 = 9;
 
 /// Records appended to one of many partitions, in fixed chunks carved from
 /// big slabs: no copying on growth, and a chunk never moves. A chunk can also
 /// be a stretch of memory someone else is done with, which saves faulting in
 /// fresh pages: on the scoring machines that costs about 75 ms per gigabyte.
 struct Buckets<T: Copy> {
-    parts: Vec<Part<T>>,
-    slabs: Vec<Vec<T>>,
+    /// Where each partition's next record goes.
+    next: Vec<*mut T>,
+    /// Each partition's newest chunk, and how many chunks it has.
+    head: Vec<u32>,
+    chunks: Vec<u32>,
+    slabs: Vec<Vec<u8>>,
     /// Every chunk's first record, and the chunk before it in its partition.
     bases: Vec<*mut T>,
     previous: Vec<u32>,
-    /// Records per chunk.
-    capacity: usize,
     /// Chunks carved from our own slabs so far.
     carved: usize,
-    /// Donated memory, each stretch big enough for one chunk.
+    /// Donated memory, each stretch a whole aligned chunk.
     spare: Vec<*mut T>,
 }
 
@@ -81,20 +80,22 @@ unsafe impl<T: Copy + Send> Send for Buckets<T> {}
 unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 
 impl<T: Copy> Buckets<T> {
-    fn new(parts: usize, capacity: usize) -> Self {
+    /// Bytes of a chunk that hold records.
+    const FILL: usize = (CHUNK_BYTES - 1) / std::mem::size_of::<T>() * std::mem::size_of::<T>();
+    /// Records per chunk.
+    const CAPACITY: usize = Self::FILL / std::mem::size_of::<T>();
+    const FITS: () = assert!(Self::CAPACITY < 1 << OFFSET_BITS && CHUNK_BYTES % std::mem::align_of::<T>() == 0);
+
+    fn new(parts: usize) -> Self {
+        let () = Self::FITS;
         Self {
-            parts: (0..parts)
-                .map(|_| Part {
-                    next: std::ptr::null_mut(),
-                    end: std::ptr::null_mut(),
-                    head: NONE,
-                    chunks: 0,
-                })
-                .collect(),
+            // A position that reads as a full chunk, so the first push grows.
+            next: vec![Self::FILL as *mut T; parts],
+            head: vec![NONE; parts],
+            chunks: vec![0; parts],
             slabs: Vec::new(),
             bases: Vec::new(),
             previous: Vec::new(),
-            capacity,
             carved: 0,
             spare: Vec::new(),
         }
@@ -103,74 +104,71 @@ impl<T: Copy> Buckets<T> {
     #[inline(always)]
     fn push(&mut self, part: usize, value: T) {
         unsafe {
-            let mut slot = self.parts.as_mut_ptr().add(part);
-            if (*slot).next == (*slot).end {
-                self.grow(part);
-                slot = self.parts.as_mut_ptr().add(part);
+            let slot = self.next.as_mut_ptr().add(part);
+            let mut at = *slot;
+            if at as usize & (CHUNK_BYTES - 1) == Self::FILL {
+                at = self.grow(part);
             }
-            (*slot).next.write(value);
-            (*slot).next = (*slot).next.add(1);
+            at.write(value);
+            *slot = at.add(1);
         }
     }
 
-    /// Hands over memory with room for one chunk, aligned for `T`.
+    /// Hands over one whole chunk's memory, aligned to `CHUNK_BYTES`.
     fn donate(&mut self, memory: *mut u8) {
-        if memory as usize % std::mem::align_of::<T>() == 0 {
-            self.spare.push(memory as *mut T);
-        }
+        debug_assert!(memory as usize % CHUNK_BYTES == 0);
+        self.spare.push(memory as *mut T);
     }
 
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, part: usize) {
+    fn grow(&mut self, part: usize) -> *mut T {
         let base = match self.spare.pop() {
             Some(base) => base,
             None => {
                 if self.carved % SLAB == 0 {
-                    let slab = Vec::with_capacity(SLAB * self.capacity);
-                    huge(slab.as_ptr(), SLAB * self.capacity);
+                    let slab: Vec<u8> = Vec::with_capacity((SLAB + 1) * CHUNK_BYTES);
+                    huge(slab.as_ptr(), (SLAB + 1) * CHUNK_BYTES);
                     self.slabs.push(slab);
                 }
-                let slab = self.slabs.last().unwrap().as_ptr() as *mut T;
-                let base = unsafe { slab.add((self.carved % SLAB) * self.capacity) };
+                let slab = self.slabs.last().unwrap().as_ptr() as usize;
+                let first = (slab + CHUNK_BYTES - 1) & !(CHUNK_BYTES - 1);
+                let base = (first + (self.carved % SLAB) * CHUNK_BYTES) as *mut T;
                 self.carved += 1;
-                populate(base, self.capacity);
+                populate(base as *const u8, CHUNK_BYTES);
                 base
             }
         };
         let chunk = self.bases.len() as u32;
         self.bases.push(base);
-        let slot = &mut self.parts[part];
-        slot.chunks += 1;
-        self.previous.push(slot.head);
-        slot.head = chunk;
-        slot.next = base;
-        slot.end = unsafe { base.add(self.capacity) };
+        self.previous.push(self.head[part]);
+        self.head[part] = chunk;
+        self.chunks[part] += 1;
+        base
     }
 
     /// Gives our own slabs back now, from whichever thread calls: at exit the
     /// kernel would free them page by page on one thread, inside the timed run.
     fn release(&self) {
         for slab in &self.slabs {
-            release(slab.as_ptr(), SLAB * self.capacity);
+            release(slab.as_ptr(), (SLAB + 1) * CHUNK_BYTES);
         }
     }
 
     /// Appends every chunk of `part` to `out` as (first record, count).
     fn chunks(&self, part: usize, out: &mut Vec<(*mut T, usize)>) {
-        let slot = &self.parts[part];
-        let mut chunk = slot.head;
+        let mut chunk = self.head[part];
         if chunk == NONE {
             return;
         }
         let base = self.bases[chunk as usize];
-        out.push((base, unsafe { slot.next.offset_from(base) } as usize));
+        out.push((base, unsafe { self.next[part].offset_from(base) } as usize));
         loop {
             chunk = self.previous[chunk as usize];
             if chunk == NONE {
                 break;
             }
-            out.push((self.bases[chunk as usize], self.capacity));
+            out.push((self.bases[chunk as usize], Self::CAPACITY));
         }
     }
 }
@@ -404,9 +402,7 @@ pub fn huge<T>(start: *const T, count: usize) {
         let from = (start as usize + 4095) & !4095;
         let to = (start as usize + bytes) & !4095;
         if to > from + (1 << 21) && HUGE.load(Ordering::Relaxed) != 0 {
-            if madvise(from as *mut _, to - from, MADV_HUGEPAGE) != 0 {
-                scan::POPULATE_FAILED.fetch_add(1 << 32, Ordering::Relaxed);
-            }
+            madvise(from as *mut _, to - from, MADV_HUGEPAGE);
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -498,7 +494,6 @@ struct Shared {
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
-    mode: u32,
     id_bits: u32,
     person_bits: u32,
     ahead: usize,
@@ -557,10 +552,7 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-static LINKS_READ_MICROS: AtomicUsize = AtomicUsize::new(0);
-
 fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
-    let reading = Instant::now();
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     for path in &shared.link_files {
         let source = Source::open(path, true)?;
@@ -579,7 +571,6 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
             start = end;
         }
     }
-    LINKS_READ_MICROS.store(reading.elapsed().as_micros() as usize, Ordering::Relaxed);
     Ok(Links::build(&pairs))
 }
 
@@ -590,7 +581,6 @@ fn person_part(person: u64, bits: u32) -> usize {
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut Buckets<Parsed>) {
     let id_shift = 64 - shared.id_bits;
-    let mode = shared.mode;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -647,11 +637,6 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        if mode == 3 {
-            // Benchmark mode 3: parse everything, store nothing.
-            std::hint::black_box(record);
-            return;
-        }
         out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
     });
 }
@@ -727,30 +712,12 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = Buckets::new(1 << shared.id_bits, CHUNK);
-    let mut clicks = Buckets::new(1 << shared.person_bits, CHUNK);
+    let mut events = Buckets::new(1 << shared.id_bits);
+    let mut clicks = Buckets::new(1 << shared.person_bits);
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
-        if shared.mode == 0 {
-            continue;
-        }
-        if shared.mode == 1 {
-            std::hint::black_box(block.count());
-            continue;
-        }
-        // Benchmark mode 2: stop after splitting lines.
-        if shared.mode == 2 {
-            let mut sum = 0u64;
-            if work.events {
-                block.lines::<7>(|_, fields| sum += (fields[0].0 + fields[6].1) as u64);
-            } else {
-                block.lines::<4>(|_, fields| sum += (fields[0].0 + fields[3].1) as u64);
-            }
-            std::hint::black_box(sum);
-            continue;
-        }
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
@@ -766,8 +733,7 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
     let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
-    let room = CHUNK * std::mem::size_of::<Parsed>() / std::mem::size_of::<Event>();
-    let mut out = Buckets::new(1 << shared.person_bits, room);
+    let mut out = Buckets::new(1 << shared.person_bits);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut table: Vec<u32> = Vec::new();
@@ -793,7 +759,7 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                 for offset in 0..count {
                     let record = base.add(offset);
                     let id = (*record).id;
-                    let entry = ((index << 8) | offset) as u32;
+                    let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let mut slot = (id.wrapping_mul(MIX) >> 24) as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
@@ -801,7 +767,10 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                             *table.get_unchecked_mut(slot) = entry;
                             break;
                         }
-                        let other = chunks.get_unchecked((seen >> 8) as usize).0.add((seen & 255) as usize);
+                        let other = chunks
+                            .get_unchecked((seen >> OFFSET_BITS) as usize)
+                            .0
+                            .add((seen & ((1 << OFFSET_BITS) - 1)) as usize);
                         if (*other).id == id {
                             if (*record).ingest < (*other).ingest {
                                 (*other).ts = DEAD;
@@ -1227,9 +1196,7 @@ fn session_worker(
             if reached.len() > 1 {
                 reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
             }
-            if shared.mode != 5 {
-                sessions.person(person, mine, reached)?;
-            }
+            sessions.person(person, mine, reached)?;
             from = to;
             click_from = click_to;
         }
@@ -1243,32 +1210,27 @@ fn session_worker(
 
 // ---------------------------------------------------------------- main
 
-/// CPU seconds in user and kernel mode, thousands of page faults, and
-/// thousands of times a thread blocked, for the whole process so far.
-fn usage() -> [f64; 4] {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        unsafe extern "C" {
-            fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
-        }
-        let mut raw = [0i64; 18];
-        getrusage(0, &mut raw);
-        return [
-            raw[0] as f64 + raw[1] as f64 / 1e6,
-            raw[2] as f64 + raw[3] as f64 / 1e6,
-            raw[8] as f64 / 1e3,
-            raw[16] as f64 / 1e3,
-        ];
-    }
-    #[cfg(not(target_os = "linux"))]
-    [0.0; 4]
-}
-
 fn tune(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+/// One thread per CPU, except under a cgroup CPU quota (the scorer's
+/// `cpu.max` is 8 CPUs on a larger host): there, half as many threads again
+/// measured about 10% faster, since threads also wait on page faults.
+fn default_threads() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(8, usize::from);
+    let quota = fs::read_to_string("/sys/fs/cgroup/cpu.max").unwrap_or_default();
+    let mut parts = quota.split_whitespace();
+    match (
+        parts.next().and_then(|max| max.parse::<u64>().ok()),
+        parts.next().and_then(|period| period.parse::<u64>().ok()),
+    ) {
+        (Some(max), Some(period)) if period > 0 && max.div_ceil(period) as usize == cpus => cpus + cpus / 2,
+        _ => cpus,
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -1288,7 +1250,7 @@ fn main() -> io::Result<()> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&count| count > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
+        .unwrap_or_else(default_threads)
         .min(32);
 
     let manifest = fs::read_to_string(data.join("manifest.json"))?;
@@ -1393,7 +1355,6 @@ fn main() -> io::Result<()> {
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
-        mode: tune("SS_MODE", 9) as u32,
         id_bits: tune("SS_ID_BITS", ID_BITS as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", PERSON_BITS as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
@@ -1407,7 +1368,6 @@ fn main() -> io::Result<()> {
     fs::create_dir_all(shared.output.join("campaign_daily"))?;
     let shared = &shared;
     let setup = began.elapsed();
-    let used_setup = usage();
 
     let parsed: Vec<(Buckets<Parsed>, Buckets<Click>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -1420,7 +1380,6 @@ fn main() -> io::Result<()> {
     })?;
     let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
-    let used_parse = usage();
 
     let next = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
@@ -1430,7 +1389,6 @@ fn main() -> io::Result<()> {
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     let dedup = began.elapsed();
-    let used_dedup = usage();
     let parsed_events = &parsed_events;
 
     // Biggest person buckets first, so a whale's is never the last one running.
@@ -1438,7 +1396,7 @@ fn main() -> io::Result<()> {
     let weight = |part: u32| {
         events
             .iter()
-            .map(|buckets| buckets.parts[part as usize].chunks as u64)
+            .map(|buckets| buckets.chunks[part as usize] as u64)
             .sum::<u64>()
     };
     order.sort_by_key(|&part| std::cmp::Reverse(weight(part)));
@@ -1457,7 +1415,6 @@ fn main() -> io::Result<()> {
             .collect::<io::Result<Vec<_>>>()
     })?;
     let sessions = began.elapsed();
-    let used_sessions = usage();
 
     if !results.iter().any(|result| result.1) {
         let path = shared.output.join("user_daily").join("part-000.parquet");
@@ -1534,29 +1491,6 @@ fn main() -> io::Result<()> {
         }
     });
     let total = began.elapsed();
-    let used = usage();
-    {
-        let failed = scan::POPULATE_FAILED.load(Ordering::Relaxed);
-        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
-        let pick = |key: &str| status.lines().find(|line| line.starts_with(key)).map_or(String::new(), |line| line.split_whitespace().nth(1).unwrap_or("").to_string());
-        let smaps = fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
-        let roll = |key: &str| smaps.lines().find(|line| line.starts_with(key)).map_or(String::new(), |line| line.split_whitespace().nth(1).unwrap_or("").to_string());
-        eprint!("popfail={} errno={} hugefail={} hwm={} anonhuge={} rss={} ", failed & 0xFFFF_FFFF, scan::POPULATE_ERRNO.load(Ordering::Relaxed), failed >> 32, pick("VmHWM:"), roll("AnonHugePages:"), roll("Rss:"));
-    }
-    eprintln!(
-        "cpu parse={:.2}+{:.2} dedup={:.2}+{:.2} sessions={:.2}+{:.2} end={:.2}+{:.2} kfaults={:.0} kblocks={:.1} linkread={:.3}",
-        used_parse[0] - used_setup[0],
-        used_parse[1] - used_setup[1],
-        used_dedup[0] - used_parse[0],
-        used_dedup[1] - used_parse[1],
-        used_sessions[0] - used_dedup[0],
-        used_sessions[1] - used_dedup[1],
-        used[0] - used_sessions[0],
-        used[1] - used_sessions[1],
-        used[2],
-        used[3],
-        LINKS_READ_MICROS.load(Ordering::Relaxed) as f64 / 1e6
-    );
     eprintln!(
         "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
         setup.as_secs_f64(),

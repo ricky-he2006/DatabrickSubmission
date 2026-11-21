@@ -90,9 +90,6 @@ fn fetch(target: *const u8) {
     let _ = target;
 }
 
-pub static POPULATE_FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static POPULATE_ERRNO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 pub struct Block {
     buf: Vec<u8>,
     base: *const u8,
@@ -103,7 +100,7 @@ pub struct Block {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64, u64) {
+unsafe fn window(p: *const u8) -> (u64, u64) {
     unsafe {
         use std::arch::x86_64::*;
         let low = _mm256_loadu_si256(p as *const __m256i);
@@ -113,21 +110,105 @@ unsafe fn window(p: *const u8) -> (u64, u64, u64) {
             _mm256_set1_epi8(b'\n' as i8),
             _mm256_set1_epi8(b'"' as i8),
         );
+        let ends = |v: __m256i| _mm256_or_si256(_mm256_cmpeq_epi8(v, comma), _mm256_cmpeq_epi8(v, newline));
         let bits = |v: __m256i| _mm256_movemask_epi8(v) as u32 as u64;
-        let both = |low: __m256i, high: __m256i| bits(low) | (bits(high) << 32);
-        let (line_low, line_high) = (_mm256_cmpeq_epi8(low, newline), _mm256_cmpeq_epi8(high, newline));
-        let lines = both(line_low, line_high);
         (
-            both(_mm256_cmpeq_epi8(low, comma), _mm256_cmpeq_epi8(high, comma)) | lines,
-            lines,
-            both(_mm256_cmpeq_epi8(low, quote), _mm256_cmpeq_epi8(high, quote)),
+            bits(ends(low)) | (bits(ends(high)) << 32),
+            bits(_mm256_cmpeq_epi8(low, quote)) | (bits(_mm256_cmpeq_epi8(high, quote)) << 32),
         )
+    }
+}
+
+/// Commas, newlines and quotes of the 64 bytes at `p`, one bit per byte.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
+    unsafe {
+        use std::arch::x86_64::*;
+        let low = _mm256_loadu_si256(p as *const __m256i);
+        let high = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let find = |byte: u8| {
+            let wanted = _mm256_set1_epi8(byte as i8);
+            let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, wanted)) as u32 as u64;
+            let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, wanted)) as u32 as u64;
+            a | (b << 32)
+        };
+        (find(b','), find(b'\n'), find(b'"'))
     }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64, u64) {
+unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
+    unsafe {
+        use std::arch::aarch64::*;
+        let chunks = [vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)), vld1q_u8(p.add(48))];
+        // Narrowing shifts pack four bits per byte: 64 bytes into a 256-bit
+        // mask in four u64s; one bit of each nibble is kept.
+        let find = |byte: u8| -> u64 {
+            let wanted = vdupq_n_u8(byte);
+            let mut out = 0u64;
+            for (at, chunk) in chunks.iter().enumerate() {
+                let hit = vceqq_u8(*chunk, wanted);
+                let nibbles = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)), 0);
+                // One bit per byte: bit 4k of `nibbles` for byte k.
+                let mut bits = nibbles & 0x1111_1111_1111_1111;
+                bits = (bits | (bits >> 3)) & 0x0303_0303_0303_0303;
+                bits = (bits | (bits >> 6)) & 0x000F_000F_000F_000F;
+                bits = (bits | (bits >> 12)) & 0x0000_00FF_0000_00FF;
+                bits = (bits | (bits >> 24)) & 0xFFFF;
+                out |= bits << (16 * at);
+            }
+            out
+        };
+        (find(b','), find(b'\n'), find(b'"'))
+    }
+}
+
+#[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn classes(p: *const u8) -> (u64, u64, u64) {
+    unsafe {
+        let (mut commas, mut newlines, mut quotes) = (0u64, 0u64, 0u64);
+        for at in 0..64 {
+            let byte = *p.add(at);
+            commas |= u64::from(byte == b',') << at;
+            newlines |= u64::from(byte == b'\n') << at;
+            quotes |= u64::from(byte == b'"') << at;
+        }
+        (commas, newlines, quotes)
+    }
+}
+
+/// Writes the position of every set bit of `bits`, plus `base`, at `out`,
+/// and returns how many. Up to `UNROLL` are written without a branch; `out`
+/// needs room for 64 + `UNROLL`.
+#[inline(always)]
+unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) -> usize {
+    unsafe {
+        let count = bits.count_ones() as usize;
+        for at in 0..UNROLL {
+            *out.add(at) = base + bits.trailing_zeros();
+            bits &= bits.wrapping_sub(1);
+        }
+        if count > UNROLL {
+            let mut at = UNROLL;
+            while bits != 0 {
+                *out.add(at) = base + bits.trailing_zeros();
+                bits &= bits.wrapping_sub(1);
+                at += 1;
+            }
+        }
+        count
+    }
+}
+
+/// Chunks of 64 bytes indexed before their lines are handed out.
+const WINDOW: usize = 64;
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn window(p: *const u8) -> (u64, u64) {
     unsafe {
         use std::arch::aarch64::*;
         let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
@@ -150,12 +231,6 @@ unsafe fn window(p: *const u8) -> (u64, u64, u64) {
         (
             pack([ends(chunks[0]), ends(chunks[1]), ends(chunks[2]), ends(chunks[3])]),
             pack([
-                vceqq_u8(chunks[0], newline),
-                vceqq_u8(chunks[1], newline),
-                vceqq_u8(chunks[2], newline),
-                vceqq_u8(chunks[3], newline),
-            ]),
-            pack([
                 vceqq_u8(chunks[0], quote),
                 vceqq_u8(chunks[1], quote),
                 vceqq_u8(chunks[2], quote),
@@ -167,16 +242,15 @@ unsafe fn window(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
 #[inline(always)]
-unsafe fn window(p: *const u8) -> (u64, u64, u64) {
+unsafe fn window(p: *const u8) -> (u64, u64) {
     unsafe {
-        let (mut ends, mut lines, mut quotes) = (0u64, 0u64, 0u64);
+        let (mut ends, mut quotes) = (0u64, 0u64);
         for at in 0..64 {
             let byte = *p.add(at);
             ends |= u64::from(byte == b',' || byte == b'\n') << at;
-            lines |= u64::from(byte == b'\n') << at;
             quotes |= u64::from(byte == b'"') << at;
         }
-        (ends, lines, quotes)
+        (ends, quotes)
     }
 }
 
@@ -186,7 +260,7 @@ unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
     unsafe {
         let mut end = start + 64;
         loop {
-            let (ends, _, _) = window(buf.add(end));
+            let (ends, _) = window(buf.add(end));
             if ends != 0 {
                 end += ends.trailing_zeros() as usize;
                 break;
@@ -270,18 +344,191 @@ impl Block {
         Ok(())
     }
 
-    pub fn count(&self) -> u64 {
-        let mut total = 0u64;
-        let mut at = 0;
-        while at < self.end {
-            total += unsafe { window(self.base.add(at)) }.0.count_ones() as u64;
-            at += 64;
+    /// The fields of the line starting at `start`, the old way: the line's
+    /// bytes in 64-byte windows. Returns where its newline is, and the fields
+    /// if the line is well formed.
+    #[inline(never)]
+    unsafe fn split_line<const N: usize>(buf: *const u8, start: usize) -> (usize, Option<[(u32, u32); N]>) {
+        unsafe {
+            let mut fields = [(0u32, 0u32); N];
+            let mut count = 0usize;
+            let mut ok = true;
+            let mut start = start;
+            let mut at = start;
+            let (mut ends, mut quotes) = window(buf.add(at));
+            loop {
+                let mut shift = start - at;
+                let mut rest = if shift < 64 { ends >> shift } else { 0 };
+                if rest == 0 {
+                    at = start;
+                    (ends, quotes) = window(buf.add(at));
+                    shift = 0;
+                    rest = ends;
+                }
+                let (stop, fine, opens) = if rest != 0 {
+                    let length = rest.trailing_zeros();
+                    let inside = (quotes >> shift) & ((1u64 << length) - 1);
+                    let opens = inside & 1;
+                    let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
+                    (
+                        start + length as usize,
+                        inside == wanted && (opens == 0 || length >= 2),
+                        opens as usize,
+                    )
+                } else {
+                    ends = 0;
+                    long_field(buf, start)
+                };
+                ok &= fine;
+                if count < N {
+                    fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+                }
+                count += 1;
+                if *buf.add(stop) == b'\n' {
+                    return (stop, if ok && count == N { Some(fields) } else { None });
+                }
+                start = stop + 1;
+            }
         }
-        total
     }
 
+    /// Hands every well-formed line of the block to `visit`, as its fields.
+    ///
+    /// The bytes are classified 64 at a time, and the positions of commas and
+    /// newlines written out a window at a time; a line is then its newline and
+    /// the commas before it. Quote rules are checked on the masks: every quote
+    /// must start or end a field, a field that starts with one must end with
+    /// one, and a lone `"` is no field. A 64-byte chunk that breaks one of these
+    /// sends its lines down the old path, which says exactly which are wrong.
     #[inline(always)]
     pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
+        let buf = self.base;
+        let (own_end, end) = (self.own_end, self.end);
+        unsafe {
+            let head = std::slice::from_raw_parts(buf, own_end.min(end));
+            let Some(first) = head.iter().position(|&byte| byte == b'\n') else {
+                return;
+            };
+            if first + 1 >= end {
+                return;
+            }
+            let end = end as u32;
+            let mut commas: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 256);
+            let mut newlines: Vec<u32> = Vec::with_capacity(WINDOW * 64 + 64);
+            // Starts of chunks that break a quote rule; the last is a sentinel.
+            let mut bad: Vec<u32> = Vec::new();
+            let mut bad_at = 0usize;
+            let mut kept = 0usize;
+            let mut line = first as u32 + 1;
+            let mut at = line;
+            // A quoted field open across the chunk edge: its closing separator
+            // is still to come.
+            let mut carry = u64::from(*buf.add(line as usize) == b'"');
+            while at < end {
+                if commas.capacity() < kept + WINDOW * 64 + 128 {
+                    // The commas kept from the last window move with the buffer.
+                    commas.set_len(kept);
+                    commas.reserve(WINDOW * 64 + 128);
+                }
+                let mut count = kept;
+                let mut lines = 0usize;
+                let out = commas.as_mut_ptr();
+                let ends = newlines.as_mut_ptr();
+                let mut chunk = 0;
+                while chunk < WINDOW && at < end {
+                    let p = buf.add(at as usize);
+                    fetch(p.wrapping_add(READ_AHEAD));
+                    let (mut comma, mut newline, mut quote) = classes(p);
+                    let left = end - at;
+                    if left < 64 {
+                        let valid = (1u64 << left) - 1;
+                        comma &= valid;
+                        newline &= valid;
+                        quote &= valid;
+                    }
+                    let before = *p.sub(1);
+                    // A quote just before the chunk can close a field at its first byte.
+                    if quote != 0 || carry != 0 || before == b'"' {
+                        let sep = comma | newline;
+                        let after = *p.add(64);
+                        let sep_before = (sep << 1) | u64::from(before == b',' || before == b'\n');
+                        let sep_after = (sep >> 1) | (u64::from(after == b',' || after == b'\n') << 63);
+                        let quote_before = (quote << 1) | u64::from(before == b'"');
+                        let quote_after = (quote >> 1) | (u64::from(after == b'"') << 63);
+                        let opening = quote & sep_before;
+                        let closing = quote & sep_after;
+                        let mut wrong = (quote & !(opening | closing)) | (opening & closing);
+                        // Separators after an opening quote's field, found by a carry
+                        // through each run of non-separators; they must be the
+                        // separators right after a closing quote.
+                        let opens = sep & quote_after;
+                        let (sum, over) = (!sep).overflowing_add(opens << 1);
+                        let (sum, over2) = sum.overflowing_add(carry);
+                        let mut closes = sum & sep;
+                        if left < 64 {
+                            closes &= (1u64 << left) - 1;
+                        }
+                        wrong |= closes ^ (sep & quote_before);
+                        carry = u64::from(over | over2) | (opens >> 63);
+                        if wrong != 0 {
+                            bad.push(at);
+                        }
+                    }
+                    count += flatten::<8>(comma, at, out.add(count));
+                    lines += flatten::<2>(newline, at, ends.add(lines));
+                    at += 64;
+                    chunk += 1;
+                }
+                // Sentinels: a line's commas are found by position.
+                for extra in 0..N {
+                    *out.add(count + extra) = u32::MAX;
+                }
+                bad.push(u32::MAX - 64);
+                let mut comma_at = 0usize;
+                let mut fields = [(0u32, 0u32); N];
+                for &stop in std::slice::from_raw_parts(ends, lines) {
+                    let start = line;
+                    line = stop + 1;
+                    while *bad.get_unchecked(bad_at) + 64 <= start {
+                        bad_at += 1;
+                    }
+                    if N >= 2
+                        && *out.add(comma_at + N - 2) < stop
+                        && *out.add(comma_at + N - 1) > stop
+                        && *bad.get_unchecked(bad_at) > stop
+                    {
+                        let mut from = start;
+                        for field in 0..N {
+                            let to = if field + 1 < N { *out.add(comma_at + field) } else { stop };
+                            let quoted = u32::from(*buf.add(from as usize) == b'"');
+                            *fields.get_unchecked_mut(field) = (from + quoted, to - quoted);
+                            from = to + 1;
+                        }
+                        comma_at += N - 1;
+                        visit(buf, &fields);
+                        continue;
+                    }
+                    while *out.add(comma_at) < stop {
+                        comma_at += 1;
+                    }
+                    if *bad.get_unchecked(bad_at) <= stop {
+                        let (_, found) = Self::split_line::<N>(buf, start as usize);
+                        if let Some(found) = found {
+                            visit(buf, &found);
+                        }
+                    }
+                }
+                bad.pop();
+                // Commas of the line still open move to the front.
+                kept = count - comma_at;
+                std::ptr::copy(out.add(comma_at), out, kept);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn lines_slow<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
@@ -289,22 +536,50 @@ impl Block {
             let Some(mut newline) = head.iter().position(|&byte| byte == b'\n') else {
                 return;
             };
-            let mut cursor = Cursor::new(buf, (end + 63) & !63, newline + 1);
             while newline < own_end && newline + 1 < end {
                 fetch(buf.wrapping_add(newline + READ_AHEAD));
                 fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
-                let line = newline + 1;
                 let mut fields = [(0u32, 0u32); N];
-                let found = cursor.split(line, &mut fields);
-                let ok;
-                if found != ODD {
-                    newline = found;
-                    ok = true;
-                } else {
-                    (ok, newline) = odd_line(buf, line, &mut fields);
-                    cursor = Cursor::new(buf, cursor.limit, newline + 1);
+                let mut count = 0usize;
+                let mut ok = true;
+                let mut start = newline + 1;
+                let mut at = start;
+                let (mut ends, mut quotes) = window(buf.add(at));
+                loop {
+                    let mut shift = start - at;
+                    let mut rest = if shift < 64 { ends >> shift } else { 0 };
+                    if rest == 0 {
+                        at = start;
+                        (ends, quotes) = window(buf.add(at));
+                        shift = 0;
+                        rest = ends;
+                    }
+                    let (stop, fine, opens) = if rest != 0 {
+                        let length = rest.trailing_zeros();
+                        let inside = (quotes >> shift) & ((1u64 << length) - 1);
+                        let opens = inside & 1;
+                        let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
+                        (
+                            start + length as usize,
+                            inside == wanted && (opens == 0 || length >= 2),
+                            opens as usize,
+                        )
+                    } else {
+                        ends = 0;
+                        long_field(buf, start)
+                    };
+                    ok &= fine;
+                    if count < N {
+                        fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+                    }
+                    count += 1;
+                    if *buf.add(stop) == b'\n' {
+                        newline = stop;
+                        break;
+                    }
+                    start = stop + 1;
                 }
-                if ok {
+                if ok && count == N {
                     visit(buf, &fields);
                 }
             }
@@ -312,130 +587,105 @@ impl Block {
     }
 }
 
-/// What `Cursor::split` returns for a line it leaves to `odd_line`.
-const ODD: usize = usize::MAX;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Where the scan is: a 64-byte window of the block and what is left of it.
-struct Cursor {
-    buf: *const u8,
-    /// No window starts at or after this.
-    limit: usize,
-    /// Start of the current window, a multiple of 64.
-    at: usize,
-    /// The window's commas and newlines not yet used, its newlines from the
-    /// current line on, and all its quotes.
-    ends: u64,
-    newlines: u64,
-    quotes: u64,
-    /// Quotes in the windows before `at`, and before the current line.
-    counted: u32,
-    before: u32,
-}
-
-impl Cursor {
-    #[inline(always)]
-    unsafe fn new(buf: *const u8, limit: usize, line: usize) -> Self {
-        unsafe {
-            let at = line & !63;
-            let (ends, newlines, quotes) = window(buf.add(at));
-            let keep = !0u64 << (line & 63);
-            Self {
-                buf,
-                limit,
-                at,
-                ends: ends & keep,
-                newlines: newlines & keep,
-                quotes,
-                counted: 0,
-                before: (quotes & !keep).count_ones(),
-            }
+    fn collect<const N: usize>(block: &Block, slow: bool) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut take = |buf: *const u8, fields: &[(u32, u32); N]| {
+            out.push(
+                fields
+                    .iter()
+                    .map(|&(a, b)| unsafe { std::slice::from_raw_parts(buf.add(a as usize), (b - a) as usize).to_vec() })
+                    .collect(),
+            );
+        };
+        if slow {
+            block.lines_slow::<N>(&mut take);
+        } else {
+            block.lines::<N>(&mut take);
         }
+        out
     }
 
-    /// Splits the line starting at `line` if it is the usual kind: `N` fields,
-    /// each bare or wrapped in one pair of quotes. Returns where its newline
-    /// is, or `ODD` for any other line, after which the cursor must be rebuilt.
-    /// Kept out of line so its loops have the registers to themselves.
-    #[inline(never)]
-    unsafe fn split<const N: usize>(&mut self, line: usize, fields: &mut [(u32, u32); N]) -> usize {
-        unsafe {
-            let buf = self.buf;
-            let (mut at, mut ends) = (self.at, self.ends);
-            let mut stops = [0u32; N];
-            let mut early = 0u64;
-            for stop in stops.iter_mut() {
-                while ends == 0 {
-                    if at + 64 >= self.limit {
-                        return ODD;
+    fn check<const N: usize>(text: &[u8], own: usize) {
+        // As `load` leaves a buffer: data, a final newline, zero padding.
+        let mut data = text.to_vec();
+        if data.last() != Some(&b'\n') {
+            data.push(b'\n');
+        }
+        let own = own.min(data.len());
+        let end = match data[own..].iter().position(|&byte| byte == b'\n') {
+            Some(at) => own + at + 1,
+            None => data.len(),
+        };
+        let mut buf = vec![0u8; PAD + data.len() + 4 * PAD + 64];
+        buf[PAD..PAD + data.len()].copy_from_slice(&data);
+        let block = Block {
+            buf,
+            base: std::ptr::null(),
+            own_end: own,
+            end,
+        };
+        let block = Block {
+            base: unsafe { block.buf.as_ptr().add(PAD) },
+            ..block
+        };
+        let fast = collect::<N>(&block, false);
+        let slow = collect::<N>(&block, true);
+        assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&data));
+    }
+
+    #[test]
+    fn matches_line_by_line() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..30_000 {
+            let mut text = Vec::new();
+            let lines = 1 + next() % 40;
+            for _ in 0..lines {
+                let fields = if next() % 8 == 0 { next() % 9 } else { 7 };
+                for field in 0..fields {
+                    if field > 0 {
+                        text.push(b',');
                     }
-                    // A newline left behind here ends the line before its last field.
-                    early |= self.newlines;
-                    self.counted += self.quotes.count_ones();
-                    at += 64;
-                    (ends, self.newlines, self.quotes) = window(buf.add(at));
+                    let len = match next() % 10 {
+                        0 => 0,
+                        1 => 60 + next() % 90,
+                        _ => next() % 14,
+                    };
+                    let mut value: Vec<u8> = (0..len)
+                        .map(|_| match next() % 30 {
+                            0 => b'"',
+                            1 => b'\r',
+                            _ => b'a' + (next() % 26) as u8,
+                        })
+                        .collect();
+                    match next() % 6 {
+                        0 | 1 => {
+                            value.insert(0, b'"');
+                            value.push(b'"');
+                        }
+                        2 if next() % 4 == 0 => value.insert(0, b'"'),
+                        3 if next() % 4 == 0 => value.push(b'"'),
+                        _ => {}
+                    }
+                    text.extend_from_slice(&value);
                 }
-                *stop = (at + ends.trailing_zeros() as usize) as u32;
-                ends &= ends - 1;
+                text.push(b'\n');
             }
-            self.at = at;
-            self.ends = ends;
-            let last = stops[N - 1] as usize;
-            let within = (last - at) as u32;
-            // The line's first newline must be its last separator.
-            let through = 2u64.wrapping_shl(within).wrapping_sub(1);
-            let mut odd = early | ((self.newlines & through) ^ (1u64 << within));
-            self.newlines &= !through;
-            let mut opened = 0u32;
-            let mut start = line as u32;
-            for (slot, &stop) in fields.iter_mut().zip(&stops) {
-                let opens = u32::from(*buf.add(start as usize) == b'"');
-                let closes = u32::from(*buf.add(stop as usize - 1) == b'"');
-                odd |= u64::from(opens ^ closes);
-                opened += opens;
-                *slot = (start + opens, stop - opens);
-                start = stop + 1;
+            let own = (next() as usize) % (text.len() + 1);
+            check::<7>(&text, own);
+            if round % 4 == 0 {
+                check::<2>(&text, own);
+                check::<4>(&text, text.len());
             }
-            let here = self.counted + (self.quotes & ((1u64 << within) - 1)).count_ones();
-            odd |= u64::from(here.wrapping_sub(self.before) ^ (2 * opened));
-            self.before = here;
-            if odd == 0 { last } else { ODD }
-        }
-    }
-}
-
-/// One line the fast path would not take: its fields, whether it is a good
-/// line of `N` fields, and where its newline is.
-#[cold]
-#[inline(never)]
-unsafe fn odd_line<const N: usize>(buf: *const u8, first: usize, fields: &mut [(u32, u32); N]) -> (bool, usize) {
-    unsafe {
-        let mut count = 0usize;
-        let mut ok = true;
-        let mut start = first;
-        loop {
-            let (ends, _, quotes) = window(buf.add(start));
-            let (stop, fine, opens) = if ends != 0 {
-                let length = ends.trailing_zeros();
-                let inside = quotes & ((1u64 << length) - 1);
-                let opens = inside & 1;
-                let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
-                (
-                    start + length as usize,
-                    inside == wanted && (opens == 0 || length >= 2),
-                    opens as usize,
-                )
-            } else {
-                long_field(buf, start)
-            };
-            ok &= fine;
-            if count < N {
-                fields[count] = ((start + opens) as u32, (stop - opens) as u32);
-            }
-            count += 1;
-            if *buf.add(stop) == b'\n' {
-                return (ok && count == N, stop);
-            }
-            start = stop + 1;
         }
     }
 }

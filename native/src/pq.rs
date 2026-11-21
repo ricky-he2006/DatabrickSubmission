@@ -475,9 +475,6 @@ impl Writer {
         self.out.extend_from_slice(&meta.out);
         self.out.extend_from_slice(&length.to_le_bytes());
         self.out.extend_from_slice(b"PAR1");
-        if std::env::var_os("SS_NOWRITE").is_some() {
-            return Ok(());
-        }
         File::create(&self.path)?.write_all(&self.out)
     }
 }

@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 jobs:
   bench:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -70,7 +71,6 @@ jobs:
         run: DATA=d60 CASES=bench/cases60.txt RUNS=3 bash bench/run.sh
 
   profile:
-    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -87,7 +87,7 @@ jobs:
           DATA_DIR=/dev/shm/d2 OUTPUT_DIR=/dev/shm/o NCPU=1 SS_RELEASE=0 valgrind --tool=callgrind --dump-instr=no --callgrind-out-file=/tmp/cg.out target/release/shopping-sessions 2>&1 | tail -5
           callgrind_annotate --auto=yes --threshold=99.9 /tmp/cg.out src/main.rs src/scan.rs src/ts.rs src/keys.rs src/pq.rs > /tmp/ann.txt 2>&1 || true
           grep -E "PROGRAM TOTALS" /tmp/ann.txt
-          grep -n -E "^-- (Auto|User)-annotated source|^ *[0-9]{1,3},[0-9]{3},[0-9]{3} \\(" /tmp/ann.txt | grep -v "file:function" | cut -c1-210
+          grep -n -E "^-- (Auto|User)-annotated source|^ *[0-9]{1,3},[0-9]{3},[0-9]{3} \\(|^ *[0-9]{1,3},[0-9]{3},[0-9]{3} \\(" /tmp/ann.txt | cut -c1-230
 
   perf:
     if: false
