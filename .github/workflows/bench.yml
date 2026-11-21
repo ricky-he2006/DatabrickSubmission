@@ -8,7 +8,7 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -18,17 +18,21 @@ jobs:
         with:
           fetch-depth: 0
       - name: Machine
+        run: lscpu | grep -E "Model name|^CPU\(s\)" | cut -c1-200
+      - name: Dataset cache
+        id: data
+        uses: actions/cache@v4
+        with:
+          path: data-cache
+          key: shopping-sessions-data-seed7-20m-v1
+      - name: Generate dataset
+        if: steps.data.outputs.cache-hit != 'true'
         run: |
-          lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|L2|L3" | cut -c1-200
-          free -g | head -2; uname -r
-      - name: Diag
-        run: |
-          git worktree add -q d4 origin/diag4
-          (cd d4/native && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release 2>&1 | tail -1)
-          (cd d4/gen && cargo build --release 2>&1 | tail -1)
-          sudo mkdir -p /app && sudo cp d4/gen/target/release/generate /app/generate
-          mkdir -p sc out/user_daily out/campaign_daily
-          SS_DIAG=1 NCPU=4 SCRATCH_DIR=$PWD/sc DATA_DIR=$PWD/sc/m20 OUTPUT_DIR=$PWD/out d4/native/target/release/shopping-sessions || true
+          curl -fsSL -o generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          unzip -q generator.zip -d gen && (cd gen/generator && cargo build --release 2>&1 | tail -1)
+          gen/generator/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output data-cache/d20
+      - name: Ablations
+        run: bash bench/abl.sh
 
   bench:
     if: false
