@@ -21,10 +21,10 @@ fn field(text: &str, key: &str) -> String {
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
-    fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
-    fn munmap(a: *mut u8, l: usize) -> i32;
-    fn mincore(a: *mut u8, l: usize, v: *mut u8) -> i32;
-    fn madvise(a: *mut u8, l: usize, advice: i32) -> i32;
+    fn mmap(a: *mut std::ffi::c_void, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut std::ffi::c_void;
+    fn munmap(a: *mut std::ffi::c_void, l: usize) -> i32;
+    fn mincore(a: *mut std::ffi::c_void, l: usize, v: *mut u8) -> i32;
+    fn madvise(a: *mut std::ffi::c_void, l: usize, advice: i32) -> i32;
 }
 
 /// (bytes, bytes in the page cache) of every CSV under `folder`.

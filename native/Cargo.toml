@@ -1,14 +1,7 @@
 [package]
 name = "shopping-sessions"
 version = "1.0.0"
-edition = "2021"
-
-[features]
-stats = []
-knobs = []
-testkeys = []
-pmu = []
-tl = []
+edition = "2024"
 
 [dependencies]
 
