@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        copy: [1, 2, 3]
+        copy: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,6 +70,7 @@ jobs:
         run: DATA=d60 CASES=bench/cases60.txt RUNS=3 bash bench/run.sh
 
   profile:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

@@ -11,9 +11,11 @@ git worktree add -q /tmp/base origin/a 2>/dev/null || true
 (cd "$ROOT/native" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8; cargo build --release 2>&1 | tail -1)
 BASE=/tmp/base/native/target/release/shopping-sessions
 NEW=$ROOT/native/target/release/shopping-sessions
-ALT=/tmp/alt/release/shopping-sessions
+(cd "$ROOT/native" && RUSTFLAGS="-C target-cpu=haswell" cargo build --release --target-dir /tmp/has 2>&1 | tail -1)
+(cd "$ROOT/native" && RUSTFLAGS="-C target-cpu=skylake" cargo build --release --target-dir /tmp/sky 2>&1 | tail -1)
+(cd /tmp/base/native && RUSTFLAGS="-C target-cpu=skylake" cargo build --release --target-dir /tmp/basesky 2>&1 | tail -1)
 bench() {
-RUNS=${RUNS:-7}
+RUNS=${RUNS:-5}
 declare -A best line; unset names
 names=()
 while IFS='|' read -r name which envs; do
@@ -25,7 +27,7 @@ for round in $(seq "$RUNS"); do
   for i in "${!names[@]}"; do
     name=${names[$i]}; eval "which=\$W_$i"; eval "envs=\$E_$i"
     case "$name" in 1:*) [ "$round" -gt 3 ] && continue;; esac
-    bin=$NEW; [ "$which" = base ] && bin=$BASE; [ "$which" = alt ] && bin=$ALT
+    bin=$NEW; [ "$which" = base ] && bin=$BASE; [ "$which" = has ] && bin=/tmp/has/release/shopping-sessions; [ "$which" = sky ] && bin=/tmp/sky/release/shopping-sessions; [ "$which" = basesky ] && bin=/tmp/basesky/release/shopping-sessions
     rm -rf /dev/shm/out/*
     start=$(date +%s%N)
     out=$(env DATA_DIR=/dev/shm/$D OUTPUT_DIR=/dev/shm/out NCPU=4 $envs "$bin" 2>&1)

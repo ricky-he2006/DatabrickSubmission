@@ -1,4 +1,8 @@
 base|base|
+basesky|basesky|
 new|new|
+has|has|
+sky|sky|
 1:base|base|NCPU=1
 1:new|new|NCPU=1
+1:sky|sky|NCPU=1
