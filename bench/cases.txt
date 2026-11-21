@@ -1,4 +1,6 @@
 base|base|
-split|split|
+pgo|pgo|
+v4|v4|
+pgov4|pgov4|
 1:base|base|NCPU=1
-1:split|split|NCPU=1
+1:pgo|pgo|NCPU=1
