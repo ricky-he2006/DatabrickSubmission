@@ -35,14 +35,14 @@ const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30,
 /// holds a few weeks, so nearly every date is one compare away.
 pub struct Dates {
     month: [u64; 100],
-    days: [i64; 100],
+    midnight: [i64; 100],
 }
 
 impl Dates {
     pub fn new() -> Self {
         Self {
             month: [0; 100],
-            days: [0; 100],
+            midnight: [0; 100],
         }
     }
 }
@@ -89,18 +89,19 @@ unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
             return BAD;
         }
         let slot = day as usize;
-        let days = if *dates.month.get_unchecked(slot) == raw {
-            *dates.days.get_unchecked(slot)
+        let midnight = if *dates.month.get_unchecked(slot) == raw {
+            *dates.midnight.get_unchecked(slot)
         } else {
             let days = civil_day(raw, day);
             if days == BAD {
                 return BAD;
             }
             dates.month[slot] = raw;
-            dates.days[slot] = days;
-            days
+            let midnight = days * 86_400;
+            dates.midnight[slot] = midnight;
+            midnight
         };
-        days * 86_400 + hour * 3_600 + minute * 60 + second
+        midnight + hour * 3_600 + minute * 60 + second
     }
 }
 
@@ -137,18 +138,19 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
         let second = ((sums & 0xFFFF_FFFF) + (sums >> 32)) as i64;
         let day = (_mm_cvtsi128_si32(parts) & 0xFFFF) as i64;
         let slot = day as usize;
-        let days = if *dates.month.get_unchecked(slot) == raw {
-            *dates.days.get_unchecked(slot)
+        let midnight = if *dates.month.get_unchecked(slot) == raw {
+            *dates.midnight.get_unchecked(slot)
         } else {
             let days = civil_day(raw, day);
             if days == BAD {
                 return BAD;
             }
             dates.month[slot] = raw;
-            dates.days[slot] = days;
-            days
+            let midnight = days * 86_400;
+            dates.midnight[slot] = midnight;
+            midnight
         };
-        days * 86_400 + second
+        midnight + second
     }
 }
 
