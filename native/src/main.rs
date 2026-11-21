@@ -326,7 +326,7 @@ fn main() {
     if std::env::var("XL_FIRST4K").is_ok_and(|v| v == "1") {
         sys::FIRST_SMALL.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    if std::env::var("XL_PREFAULT").is_ok_and(|v| v == "1") {
+    if !std::env::var("XL_PREFAULT").is_ok_and(|v| v == "0") {
         sys::PREFAULT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var("XL_ANONR").is_ok_and(|v| v == "0") {
@@ -337,16 +337,14 @@ fn main() {
     } else {
         sys::SPIN_TICKS.store(SPIN_US_DEFAULT * 2000, std::sync::atomic::Ordering::Relaxed);
     }
-    sys::PIN_AT_START.store(parse::pin_mode() == 2 && std::env::var("XL_PINSTART").is_ok_and(|v| v == "1"), std::sync::atomic::Ordering::Relaxed);
+    sys::PIN_AT_START.store(parse::pin_mode() == 2 && !std::env::var("XL_PINSTART").is_ok_and(|v| v == "0"), std::sync::atomic::Ordering::Relaxed);
     if std::env::var("XL_NOTOUCH").is_ok_and(|v| v == "0") {
         sys::CORE_NOTOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(v) = std::env::var("XL_KP").ok().and_then(|v| v.trim().parse().ok()) {
         sys::SETUP_KP.store(v, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Ok(v) = std::env::var("XL_RGREL") {
-        out::REGION_UNMAP.store(v == "1", std::sync::atomic::Ordering::Relaxed);
-    }
+    out::REGION_UNMAP.store(std::env::var("XL_RGREL").is_ok_and(|v| v == "1"), std::sync::atomic::Ordering::Relaxed);
     if std::env::var("XL_PPARTS").is_ok_and(|v| v == "0") {
         sys::SETUP_PARTS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -356,9 +354,9 @@ fn main() {
     let knob = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v == "1");
     unsafe {
         parse::NT = knob("XL_NT", true);
-        parse::RELEASE = knob("XL_REL", true);
+        parse::RELEASE = knob("XL_REL", false);
         parse::PREFETCH = knob("XL_PF", false);
-        sys::RELEASE.store(knob("XL_FREE", true), std::sync::atomic::Ordering::Relaxed);
+        sys::RELEASE.store(knob("XL_FREE", false), std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "knobs")]
         {
             parse::NOSINK = knob("XL_NOSINK", false);
@@ -451,7 +449,7 @@ fn main() {
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
     let endrel = std::env::var("XL_ENDREL").ok();
-    if (sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
+    if endrel.as_deref() == Some("1") || endrel.as_deref() == Some("2") {
         let nt = g.nt;
         let mut r = [[(0usize, 0usize); 12]; 16];
         for tid in 0..nt {
