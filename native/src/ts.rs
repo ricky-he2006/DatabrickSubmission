@@ -69,8 +69,9 @@ fn civil_day(raw: u64, day: i64) -> i64 {
 }
 
 /// `YYYY-MM-DDTHH:MM:SS` at `p`, as epoch seconds; `BAD` if it is not exactly that.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx2"), allow(dead_code))]
 #[inline(always)]
-unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+unsafe fn civil_seconds_plain(p: *const u8, dates: &mut Dates) -> i64 {
     unsafe {
         let raw = load64(p); // YYYY-MM-
         let b = load64(p.add(8)) ^ 0x3030_3A30_3054_3030; // DDTHH:MM
@@ -101,6 +102,57 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
         };
         days * 86_400 + hour * 3_600 + minute * 60 + second
     }
+}
+
+/// `civil_seconds_plain`, with the day and time read as one vector.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let raw = load64(p); // YYYY-MM-
+        // "-MM-DDTHH:MM:SS" and one byte the caller checks.
+        let text = _mm_loadu_si128(p.add(4) as *const __m128i);
+        let template = _mm_setr_epi8(
+            b'-' as i8, 0x30, 0x30, b'-' as i8, 0x30, 0x30, b'T' as i8, 0x30, 0x30, b':' as i8, 0x30, 0x30, b':' as i8,
+            0x30, 0x30, 0,
+        );
+        let most = _mm_setr_epi8(0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
+        // Digits become 0..=9 and separators 0; anything else is over `most`.
+        let digits = _mm_xor_si128(text, template);
+        let over = _mm_subs_epu8(digits, most);
+        let pairs = _mm_shuffle_epi8(digits, _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+        // 16-bit day, hour, minute, second.
+        let parts = _mm_maddubs_epi16(pairs, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
+        let late = _mm_cmpgt_epi16(parts, _mm_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0));
+        let wrong = _mm_or_si128(over, late);
+        if _mm_testz_si128(wrong, wrong) == 0 {
+            return BAD;
+        }
+        // 32-bit hour * 3600, then minute * 60 + second.
+        let sums = _mm_cvtsi128_si64(_mm_madd_epi16(parts, _mm_setr_epi16(0, 3600, 60, 1, 0, 0, 0, 0))) as u64;
+        let second = ((sums & 0xFFFF_FFFF) + (sums >> 32)) as i64;
+        let day = (_mm_cvtsi128_si32(parts) & 0xFFFF) as i64;
+        let slot = day as usize;
+        let days = if *dates.month.get_unchecked(slot) == raw {
+            *dates.days.get_unchecked(slot)
+        } else {
+            let days = civil_day(raw, day);
+            if days == BAD {
+                return BAD;
+            }
+            dates.month[slot] = raw;
+            dates.days[slot] = days;
+            days
+        };
+        days * 86_400 + second
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+    unsafe { civil_seconds_plain(p, dates) }
 }
 
 /// Eight ASCII digits already reduced to 0..=9 per byte, first digit lowest.
@@ -247,6 +299,41 @@ mod tests {
         let mut padded = text.as_bytes().to_vec();
         padded.extend_from_slice(&[0u8; 64]);
         unsafe { parse(padded.as_ptr(), text.len(), &mut Dates::new()) }
+    }
+
+    #[test]
+    fn vector_matches_plain() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..3_000_000 {
+            let mut text = *b"2027-12-19T18:13:05Z\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+            // Random digits, then a few random bytes anywhere.
+            for at in [2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+                if next() % 3 == 0 {
+                    text[at] = b'0' + (next() % 10) as u8;
+                }
+            }
+            for _ in 0..next() % 3 {
+                let at = (next() % 20) as usize;
+                text[at] = match next() % 4 {
+                    0 => (next() % 256) as u8,
+                    1 => b"0123456789:-TZ/ "[(next() % 16) as usize],
+                    _ => text[at],
+                };
+            }
+            let (fast, plain) = unsafe {
+                (
+                    civil_seconds(text.as_ptr(), &mut Dates::new()),
+                    civil_seconds_plain(text.as_ptr(), &mut Dates::new()),
+                )
+            };
+            assert_eq!(fast, plain, "{:?}", String::from_utf8_lossy(&text[..20]));
+        }
     }
 
     #[test]

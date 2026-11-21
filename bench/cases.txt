@@ -1,5 +1,4 @@
 base|base|
 new|new|
-map0|new|SS_MAP=0
+1:base|base|NCPU=1
 1:new|new|NCPU=1
-1:map0|new|NCPU=1 SS_MAP=0

@@ -13,7 +13,7 @@ BASE=/tmp/base/native/target/release/shopping-sessions
 NEW=$ROOT/native/target/release/shopping-sessions
 ALT=/tmp/alt/release/shopping-sessions
 bench() {
-RUNS=${RUNS:-4}
+RUNS=${RUNS:-7}
 declare -A best line; unset names
 names=()
 while IFS='|' read -r name which envs; do
@@ -37,5 +37,3 @@ echo "=== best of $RUNS, real ms (process start to exit) ==="
 for name in "${names[@]}"; do printf '%-14s %6s | %s\n' "$name" "${best[$name]}" "${line[$name]}"; done
 }
 echo "--- as copied"; grep -E "Shmem|FileHuge|ShmemHuge" /proc/meminfo | tr "\n" " "; bench
-sync; echo 1 | sudo tee /proc/sys/vm/drop_caches >/dev/null
-echo "--- after drop_caches"; grep -E "Shmem|FileHuge|ShmemHuge" /proc/meminfo | tr "\n" " "; bench

@@ -279,53 +279,103 @@ impl Block {
             let Some(mut newline) = head.iter().position(|&byte| byte == b'\n') else {
                 return;
             };
+            // Windows start at multiples of 64; no window starts at or after `limit`.
+            let limit = (end + 63) & !63;
+            let mut at = (newline + 1) & !63;
+            let (mut ends, mut quotes) = window(buf.add(at));
+            ends &= !0u64 << ((newline + 1) & 63);
+            // Quotes in the windows before `at`, and before the current line.
+            let mut counted = 0u32;
+            let mut before = (quotes & ((1u64 << ((newline + 1) & 63)) - 1)).count_ones();
             while newline < own_end && newline + 1 < end {
                 fetch(buf.wrapping_add(newline + READ_AHEAD));
                 fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
+                let line = newline + 1;
                 let mut fields = [(0u32, 0u32); N];
-                let mut count = 0usize;
-                let mut ok = true;
-                let mut start = newline + 1;
-                let mut at = start;
-                let (mut ends, mut quotes) = window(buf.add(at));
-                loop {
-                    let mut shift = start - at;
-                    let mut rest = if shift < 64 { ends >> shift } else { 0 };
-                    if rest == 0 {
-                        at = start;
-                        (ends, quotes) = window(buf.add(at));
-                        shift = 0;
-                        rest = ends;
+                // The usual line: N fields, each bare or wrapped in one pair of
+                // quotes. Anything else makes `odd` non-zero and is read again, slowly.
+                let mut odd = 0u32;
+                let mut opened = 0u32;
+                let mut start = line;
+                'fields: {
+                    for (field, slot) in fields.iter_mut().enumerate() {
+                        while ends == 0 {
+                            if at + 64 >= limit {
+                                odd = 1;
+                                break 'fields;
+                            }
+                            counted += quotes.count_ones();
+                            at += 64;
+                            (ends, quotes) = window(buf.add(at));
+                        }
+                        let stop = at + ends.trailing_zeros() as usize;
+                        ends &= ends - 1;
+                        let opens = u32::from(*buf.add(start) == b'"');
+                        let closes = u32::from(*buf.add(stop - 1) == b'"');
+                        let wanted = if field == N - 1 { b'\n' } else { b',' };
+                        odd |= (opens ^ closes) | u32::from(*buf.add(stop) ^ wanted);
+                        opened += opens;
+                        *slot = (start as u32 + opens, stop as u32 - opens);
+                        start = stop + 1;
                     }
-                    let (stop, fine, opens) = if rest != 0 {
-                        let length = rest.trailing_zeros();
-                        let inside = (quotes >> shift) & ((1u64 << length) - 1);
-                        let opens = inside & 1;
-                        let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
-                        (
-                            start + length as usize,
-                            inside == wanted && (opens == 0 || length >= 2),
-                            opens as usize,
-                        )
-                    } else {
-                        ends = 0;
-                        long_field(buf, start)
-                    };
-                    ok &= fine;
-                    if count < N {
-                        fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+                    let last = start - 1;
+                    let here = counted + (quotes & ((1u64 << (last - at)) - 1)).count_ones();
+                    odd |= (here - before) ^ (2 * opened);
+                    if odd == 0 {
+                        newline = last;
+                        before = here;
                     }
-                    count += 1;
-                    if *buf.add(stop) == b'\n' {
-                        newline = stop;
-                        break;
-                    }
-                    start = stop + 1;
                 }
-                if ok && count == N {
+                let mut ok = true;
+                if odd != 0 {
+                    (ok, newline) = odd_line(buf, line, &mut fields);
+                    at = (newline + 1) & !63;
+                    (ends, quotes) = window(buf.add(at));
+                    ends &= !0u64 << ((newline + 1) & 63);
+                    counted = 0;
+                    before = (quotes & ((1u64 << ((newline + 1) & 63)) - 1)).count_ones();
+                }
+                if ok {
                     visit(buf, &fields);
                 }
             }
+        }
+    }
+}
+
+/// One line the fast path would not take: its fields, whether it is a good
+/// line of `N` fields, and where its newline is.
+#[cold]
+#[inline(never)]
+unsafe fn odd_line<const N: usize>(buf: *const u8, first: usize, fields: &mut [(u32, u32); N]) -> (bool, usize) {
+    unsafe {
+        let mut count = 0usize;
+        let mut ok = true;
+        let mut start = first;
+        loop {
+            let (ends, quotes) = window(buf.add(start));
+            let (stop, fine, opens) = if ends != 0 {
+                let length = ends.trailing_zeros();
+                let inside = quotes & ((1u64 << length) - 1);
+                let opens = inside & 1;
+                let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
+                (
+                    start + length as usize,
+                    inside == wanted && (opens == 0 || length >= 2),
+                    opens as usize,
+                )
+            } else {
+                long_field(buf, start)
+            };
+            ok &= fine;
+            if count < N {
+                fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+            }
+            count += 1;
+            if *buf.add(stop) == b'\n' {
+                return (ok && count == N, stop);
+            }
+            start = stop + 1;
         }
     }
 }
