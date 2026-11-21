@@ -496,6 +496,7 @@ struct Shared {
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
+    mode: u32,
     id_bits: u32,
     person_bits: u32,
     ahead: usize,
@@ -639,6 +640,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
+        if shared.mode == 3 {
+            // Benchmark mode 3: parse everything, store nothing.
+            std::hint::black_box(record);
+            return;
+        }
         out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
     });
 }
@@ -720,6 +726,20 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
+        // Benchmark modes: 1 stops after the structural index, 2 after splitting lines.
+        if shared.mode == 1 {
+            continue;
+        }
+        if shared.mode == 2 {
+            let mut sum = 0u64;
+            if work.events {
+                block.lines::<7>(|_, fields| sum += (fields[0].0 + fields[6].1) as u64);
+            } else {
+                block.lines::<4>(|_, fields| sum += (fields[0].0 + fields[3].1) as u64);
+            }
+            std::hint::black_box(sum);
+            continue;
+        }
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
@@ -1210,6 +1230,27 @@ fn session_worker(
 
 // ---------------------------------------------------------------- main
 
+/// CPU seconds in user and kernel mode, thousands of page faults, and
+/// thousands of times a thread blocked, for the whole process so far.
+fn usage() -> [f64; 4] {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+        }
+        let mut raw = [0i64; 18];
+        getrusage(0, &mut raw);
+        return [
+            raw[0] as f64 + raw[1] as f64 / 1e6,
+            raw[2] as f64 + raw[3] as f64 / 1e6,
+            raw[8] as f64 / 1e3,
+            raw[16] as f64 / 1e3,
+        ];
+    }
+    #[cfg(not(target_os = "linux"))]
+    [0.0; 4]
+}
+
 fn tune(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
@@ -1339,6 +1380,7 @@ fn main() -> io::Result<()> {
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
+        mode: tune("SS_MODE", 9) as u32,
         id_bits: tune("SS_ID_BITS", ID_BITS as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", PERSON_BITS as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
@@ -1352,6 +1394,7 @@ fn main() -> io::Result<()> {
     fs::create_dir_all(shared.output.join("campaign_daily"))?;
     let shared = &shared;
     let setup = began.elapsed();
+    let used_setup = usage();
 
     let parsed: Vec<(Buckets<Parsed>, Buckets<Click>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -1364,6 +1407,7 @@ fn main() -> io::Result<()> {
     })?;
     let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
+    let used_parse = usage();
 
     let next = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
@@ -1373,6 +1417,7 @@ fn main() -> io::Result<()> {
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     let dedup = began.elapsed();
+    let used_dedup = usage();
     let parsed_events = &parsed_events;
 
     // Biggest person buckets first, so a whale's is never the last one running.
@@ -1399,6 +1444,7 @@ fn main() -> io::Result<()> {
             .collect::<io::Result<Vec<_>>>()
     })?;
     let sessions = began.elapsed();
+    let used_sessions = usage();
 
     if !results.iter().any(|result| result.1) {
         let path = shared.output.join("user_daily").join("part-000.parquet");
@@ -1475,6 +1521,20 @@ fn main() -> io::Result<()> {
         }
     });
     let total = began.elapsed();
+    let used = usage();
+    eprintln!(
+        "cpu parse={:.2}+{:.2} dedup={:.2}+{:.2} sessions={:.2}+{:.2} end={:.2}+{:.2} kfaults={:.0} kblocks={:.1}",
+        used_parse[0] - used_setup[0],
+        used_parse[1] - used_setup[1],
+        used_dedup[0] - used_parse[0],
+        used_dedup[1] - used_parse[1],
+        used_sessions[0] - used_dedup[0],
+        used_sessions[1] - used_dedup[1],
+        used[0] - used_sessions[0],
+        used[1] - used_sessions[1],
+        used[2],
+        used[3]
+    );
     eprintln!(
         "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
         setup.as_secs_f64(),

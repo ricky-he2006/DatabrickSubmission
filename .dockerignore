@@ -4,6 +4,8 @@ out/
 ref/
 dev-answer/
 tools/
+bench/
+.github/
 *.md
 .git
 __pycache__/
