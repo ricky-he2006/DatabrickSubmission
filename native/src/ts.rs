@@ -103,6 +103,50 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
     }
 }
 
+/// UTC-only fast path. The caller checks the 20-byte length and trailing Z.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+unsafe fn utc_seconds(p: *const u8, dates: &mut Dates) -> i64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let head = _mm_loadu_si128(p.cast());
+        let separators = _mm_setr_epi8(0,0,0,0,45,0,0,45,0,0,84,0,0,58,0,0);
+        if _mm_movemask_epi8(_mm_cmpeq_epi8(head, separators)) & 0x2490 != 0x2490
+            || *p.add(16) != b':' {
+            return BAD;
+        }
+        let shuffle = _mm_setr_epi8(0,1,2,3,5,6,8,9,11,12,14,15,-1,-1,-1,-1);
+        let digits = _mm_insert_epi16::<6>(
+            _mm_shuffle_epi8(head, shuffle),
+            i32::from(u16::from_le(p.add(17).cast::<u16>().read_unaligned())),
+        );
+        let digits = _mm_sub_epi8(digits, _mm_set1_epi8(b'0' as i8));
+        let valid = _mm_cmpeq_epi8(digits, _mm_min_epu8(digits, _mm_set1_epi8(9)));
+        if _mm_movemask_epi8(valid) & 0x3fff != 0x3fff {
+            return BAD;
+        }
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let day = _mm_extract_epi16::<3>(pairs) as usize;
+        let hour = _mm_extract_epi16::<4>(pairs) as i64;
+        let minute = _mm_extract_epi16::<5>(pairs) as i64;
+        let second = _mm_extract_epi16::<6>(pairs) as i64;
+        if hour > 23 || minute > 59 || second > 59 {
+            return BAD;
+        }
+        let raw = load64(p);
+        let days = if dates.month[day] == raw {
+            dates.days[day]
+        } else {
+            let days = civil_day(raw, day as i64);
+            if days == BAD { return BAD; }
+            dates.month[day] = raw;
+            dates.days[day] = days;
+            days
+        };
+        days * 86_400 + hour * 3600 + minute * 60 + second
+    }
+}
+
 /// Eight ASCII digits already reduced to 0..=9 per byte, first digit lowest.
 #[inline(always)]
 fn eight_digits(mut v: u64) -> u64 {
@@ -149,6 +193,9 @@ unsafe fn digits_slow(p: *const u8, len: usize) -> i64 {
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     unsafe {
         if len == 20 && *p.add(19) == b'Z' {
+            #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+            let seconds = utc_seconds(p, dates);
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
             let seconds = civil_seconds(p, dates);
             if seconds != BAD {
                 return seconds * 1000;
