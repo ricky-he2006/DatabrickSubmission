@@ -1,6 +1,6 @@
 base|base|
-mix|mix|
+l16|l16|
 base2|base|
-mix2|mix|
+l16b|l16|
 1:base|base|NCPU=1
-1:mix|mix|NCPU=1
+1:l16|l16|NCPU=1

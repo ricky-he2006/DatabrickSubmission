@@ -268,10 +268,35 @@ impl Dim {
 }
 
 /// user ID -> person, for every ID that a link names.
+///
+/// Every event looks its user up here, at random, so the table is kept small
+/// enough to stay in cache: one 8-byte slot per ID, holding the low bits of a
+/// mix of the ID (the top bits pick the slot) and the person's number. A
+/// person is then `PERSON | number`, and `name` gives back their ID.
 struct Links {
-    slots: Vec<[u64; 2]>,
+    slots: Vec<u64>,
     shift: u32,
+    /// Bits of a slot that hold the person's number plus one (0 is empty).
+    number_bits: u32,
+    /// Each person's ID, by number.
+    names: Vec<u64>,
     empty: bool,
+}
+
+/// Marks a linked person's number. No ID has both top bits set: packed IDs
+/// use 63 bits, and interned ones are bit 63 and a small count.
+const PERSON: u64 = 3 << 62;
+
+/// A bijective 64-bit mix (murmur3's finalizer): its low bits depend on every
+/// bit of the key, so two IDs that end alike still differ there.
+#[inline(always)]
+fn mixed(key: u64) -> u64 {
+    let mut k = key;
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    k ^ (k >> 33)
 }
 
 impl Links {
@@ -345,27 +370,57 @@ impl Links {
                 smallest[root] = name;
             }
         }
-        for at in 0..slots.len() {
-            if at + 16 < slots.len() && slots[at + 16][0] != 0 {
-                prefetch(&parent[slots[at + 16][1] as usize]);
+        drop(slots);
+        // Number the people, then fill the small table.
+        let mut number_of = vec![u32::MAX; names.len()];
+        let mut people: Vec<u64> = Vec::new();
+        let mut numbers: Vec<u32> = Vec::with_capacity(names.len());
+        for id in 0..names.len() {
+            // After the pass above every ID is at most one step from its root.
+            let root = find(&mut parent, id as u32) as usize;
+            if number_of[root] == u32::MAX {
+                number_of[root] = people.len() as u32;
+                people.push(smallest[root]);
             }
-            let entry = &mut slots[at];
-            if entry[0] != 0 {
-                // After the pass above every ID is at most one step from its root.
-                entry[1] = smallest[find(&mut parent, entry[1] as u32) as usize];
+            numbers.push(number_of[root]);
+        }
+        let number_bits = 64 - (people.len() as u64 + 1).leading_zeros();
+        let capacity = (names.len() * 3 / 2).next_power_of_two().max(16);
+        let mask = capacity - 1;
+        let shift = 64 - capacity.trailing_zeros();
+        let mut slots = vec![0u64; capacity];
+        huge(slots.as_ptr(), capacity);
+        for (id, &name) in names.iter().enumerate() {
+            let mix = mixed(name);
+            let mut slot = (mix >> shift) as usize;
+            while slots[slot] != 0 {
+                slot = (slot + 1) & mask;
             }
+            slots[slot] = (mix << number_bits) | (numbers[id] as u64 + 1);
         }
         Self {
             slots,
             shift,
+            number_bits,
+            names: people,
             empty: pairs.is_empty(),
+        }
+    }
+
+    /// The ID of `person`, as `person` gives it.
+    #[inline(always)]
+    fn name(&self, person: u64) -> u64 {
+        if person & PERSON == PERSON {
+            self.names[(person & !PERSON) as usize]
+        } else {
+            person
         }
     }
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
         if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
+            prefetch(unsafe { self.slots.get_unchecked((mixed(key) >> self.shift) as usize) });
         }
     }
 
@@ -375,14 +430,17 @@ impl Links {
             return key;
         }
         let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
+        let mix = mixed(key);
+        let mut slot = (mix >> self.shift) as usize;
+        // The slot's top bits are the mix's low bits; the rest is the number.
+        let wanted = mix << self.number_bits >> self.number_bits;
         loop {
-            let entry = unsafe { self.slots.get_unchecked(slot) };
-            if entry[0] == key {
-                return entry[1];
-            }
-            if entry[0] == 0 {
+            let entry = unsafe { *self.slots.get_unchecked(slot) };
+            if entry == 0 {
                 return key;
+            }
+            if entry >> self.number_bits == wanted {
+                return PERSON | ((entry & ((1 << self.number_bits) - 1)) - 1);
             }
             slot = (slot + 1) & mask;
         }
@@ -606,7 +664,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let user = keys::pack(p, n);
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
-        let at = ts::parse_mixed(p, n, dates);
+        let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
@@ -667,7 +725,7 @@ fn parse_clicks(
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
-        let at = ts::parse_mixed(p, n, dates);
+        let at = ts::parse(p, n, dates);
         if campaign == 0 || at < earliest || at >= window_end {
             return;
         }
@@ -852,7 +910,8 @@ impl Sessions<'_> {
             )?);
         }
         let writer = self.writer.as_mut().unwrap();
-        writer.keyed(0, person, |name| keys::unpack(person, name));
+        let links = shared.links.get().unwrap();
+        writer.keyed(0, person, |name| keys::unpack(links.name(person), name));
         writer.int(1, shared.first_day + day as i64);
         writer.int(2, sessions as i64);
         writer.int(3, events as i64);
