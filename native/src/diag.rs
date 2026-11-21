@@ -120,13 +120,18 @@ fn child(settings: &[(&str, String)]) -> Timing {
     let status = process.wait();
     let real = began.elapsed().as_secs_f64() * 1000.0;
     // "setup=0.008 parse=0.150 ..." -> "8 150 ...", in milliseconds.
-    let line = log.lines().rev().find(|line| line.contains("total=")).unwrap_or("");
-    let mut phases: String = line
-        .split_whitespace()
-        .filter_map(|part| part.split_once('=')?.1.parse::<f64>().ok())
-        .map(|seconds| format!("{:.0}", seconds * 1000.0))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let numbers = |marker: &str| -> String {
+        log.lines()
+            .rev()
+            .find(|line| line.contains(marker))
+            .unwrap_or("")
+            .split_whitespace()
+            .filter_map(|part| part.split_once('=')?.1.parse::<f64>().ok())
+            .map(|seconds| format!("{:.0}", seconds * 1000.0))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut phases = format!("{} | {}", numbers("total="), numbers("pu="));
     if !status.is_ok_and(|status| status.success()) {
         phases = format!("FAILED {}", log.lines().last().unwrap_or(""));
     }
@@ -236,67 +241,71 @@ pub fn run() -> ! {
             writes.push(format!("{folder} {megabytes}MB={took:.0}{}", if ok { "" } else { "!" }));
         }
     }
-    head.push(format!("write ms: {}", writes.join(" ")));
-    for line in &head {
-        eprintln!("{line}");
-    }
+    // The scorer shows only about 3000 characters and the machine is known
+    // from the first run, so print just what is new.
+    eprintln!("start={created:.0}ms write: {}", writes.join(" "));
+    let _ = head;
 
-    // Enough copies of the dev set to parse about as many bytes as a 20M-event run.
-    let copies = (1_800u64 << 20)
-        .div_ceil((events + clicks).max(1))
-        .clamp(1, 60)
-        .to_string();
-    let scaled = |extra: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
-        let mut settings = vec![("SS_COPIES", copies.clone())];
+    // A real practice-size dataset, from the track's own generator.
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into());
+    let big = format!("{scratch}/d20");
+    let generating = Instant::now();
+    let generated = Command::new("/app/generate")
+        .args([
+            "--seed", "7", "--events", "20000000", "--clicks", "5000000", "--output", &big,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    eprintln!(
+        "generate ok={generated} took {:.1}s",
+        generating.elapsed().as_secs_f64()
+    );
+    let on = |extra: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+        let mut settings = vec![("DATA_DIR", big.clone())];
         settings.extend(extra.iter().map(|&(name, value)| (name, value.to_string())));
         settings
     };
     let variants: Vec<(&str, Vec<(&'static str, String)>)> = vec![
         ("dev", vec![]),
-        ("base", scaled(&[])),
-        ("nowrite", scaled(&[("SS_NOWRITE", "1")])),
-        ("to-scratch", scaled(&[("OUTPUT_DIR", "/scratch/out")])),
-        ("to-tmp", vec![("OUTPUT_DIR", "/tmp/out".to_string())]),
-        ("base", scaled(&[])),
-        ("nowrite", scaled(&[("SS_NOWRITE", "1")])),
-        ("huge0", scaled(&[("SS_HUGE", "0")])),
-        ("rel0", scaled(&[("SS_RELEASE", "0")])),
-        ("map0", scaled(&[("SS_MAP", "0")])),
-        ("pb10", scaled(&[("SS_PERSON_BITS", "10")])),
-        ("id10pb10", scaled(&[("SS_ID_BITS", "10"), ("SS_PERSON_BITS", "10")])),
-        ("ncpu1", scaled(&[("NCPU", "1")])),
-        ("ncpu2", scaled(&[("NCPU", "2")])),
-        ("ncpu4", scaled(&[("NCPU", "4")])),
-        ("ncpu10", scaled(&[("NCPU", "10")])),
-        ("ncpu12", scaled(&[("NCPU", "12")])),
-        ("ncpu16", scaled(&[("NCPU", "16")])),
-        (
-            "x3",
-            vec![("SS_COPIES", (copies.parse::<u64>().unwrap() * 3).min(100).to_string())],
-        ),
+        ("base", on(&[])),
+        ("nowrite", on(&[("SS_NOWRITE", "1")])),
+        ("index", on(&[("SS_MODE", "1")])),
+        ("lines", on(&[("SS_MODE", "2")])),
+        ("nopush", on(&[("SS_MODE", "3")])),
+        ("base", on(&[])),
+        ("huge0", on(&[("SS_HUGE", "0")])),
+        ("rel0", on(&[("SS_RELEASE", "0")])),
+        ("map0", on(&[("SS_MAP", "0")])),
+        ("ncpu2", on(&[("NCPU", "2")])),
+        ("ncpu4", on(&[("NCPU", "4")])),
+        ("ncpu6", on(&[("NCPU", "6")])),
+        ("ncpu10", on(&[("NCPU", "10")])),
+        ("ncpu12", on(&[("NCPU", "12")])),
+        ("ncpu16", on(&[("NCPU", "16")])),
+        ("1:base", on(&[("NCPU", "1")])),
+        ("1:index", on(&[("NCPU", "1"), ("SS_MODE", "1")])),
+        ("1:lines", on(&[("NCPU", "1"), ("SS_MODE", "2")])),
+        ("1:nopush", on(&[("NCPU", "1"), ("SS_MODE", "3")])),
     ];
 
-    let first = child(&[]);
-    let mut table = vec![format!("first-dev {:.0} | {}", first.real, first.phases)];
+    let mut table: Vec<String> = Vec::new();
     for (name, settings) in &variants {
         // Leave room inside the dev run's three minutes.
         if began.elapsed().as_secs() > 110 {
             table.push(format!("{name} skipped"));
             continue;
         }
-        let runs = if ["ncpu1", "x3"].contains(name) { 1 } else { 3 };
+        let runs = if name.starts_with("1:") { 1 } else { 3 };
         let mut all: Vec<Timing> = (0..runs).map(|_| child(settings)).collect();
         all.sort_by(|a, b| a.real.total_cmp(&b.real));
         let reals: Vec<String> = all.iter().map(|timing| format!("{:.0}", timing.real)).collect();
         table.push(format!("{name} {} | {}", reals.join("/"), all[0].phases));
     }
 
-    eprintln!("copies={copies}; ms: name real(sorted) | setup parse dedup sessions write links total (best run)");
+    eprintln!("ms: real x3 | setup parse dedup sess write links total | cpu u/s parse dedup sess write, kflt kblk");
     for line in &table {
-        eprintln!("{line}");
-    }
-    // Once more at the very end, in case only the tail of the log is shown.
-    for line in &head {
         eprintln!("{line}");
     }
     eprintln!("diag took {:.1}s; exiting 1 on purpose", began.elapsed().as_secs_f64());

@@ -24,7 +24,17 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
       cargo build --locked --release --target "$target" && \
     cp "target/$target/release/shopping-sessions" /shopping-sessions
 
+# Diagnostic branch only: the track's generator, to benchmark on real-size data.
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates && \
+    curl -fsSL -o /generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip && \
+    mkdir /generator && unzip -q /generator.zip -d /generator && cd /generator/generator && \
+    target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
+    if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
+    RUSTFLAGS="-C linker=$linker" cargo build --release --target "$target" && \
+    cp "target/$target/release/generate" /generate
+
 FROM debian:bookworm-slim
+COPY --from=builder /generate /app/generate
 COPY --from=builder /shopping-sessions /app/shopping-sessions
 CMD ["/app/shopping-sessions"]
 # Diagnostic branch only: benchmark on the scorer, print the results, exit 1.
