@@ -313,6 +313,8 @@ impl Block {
                 fetch(buf.wrapping_add(newline + READ_AHEAD));
                 fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
                 let mut fields = [(0u32, 0u32); N];
+                let mut well_formed = false;
+                let mut general = true;
                 if WIDE {
                     // The whole line at once: its first 128 bytes as bit masks, and
                     // every field read off them with no branch that depends on the
@@ -339,53 +341,56 @@ impl Block {
                     // quotes on the line the ones that wrap a field.
                     if stop < 128 && newlines.trailing_zeros() == stop {
                         let inside = quotes & ((1u128 << stop) - 1);
-                        if fine && inside.count_ones() == 2 * quoted {
-                            visit(buf, &fields);
-                        }
                         newline = line + stop as usize;
-                        continue;
+                        // One call site for `visit`, shared with the general loop,
+                        // so that it is inlined.
+                        well_formed = fine && inside.count_ones() == 2 * quoted;
+                        general = false;
                     }
                 }
-                let mut count = 0usize;
-                let mut ok = true;
-                let mut start = newline + 1;
-                let mut at = start;
-                let (mut ends, mut quotes) = window(buf.add(at));
-                loop {
-                    let mut shift = start - at;
-                    let mut rest = if shift < 64 { ends >> shift } else { 0 };
-                    if rest == 0 {
-                        at = start;
-                        (ends, quotes) = window(buf.add(at));
-                        shift = 0;
-                        rest = ends;
+                if general {
+                    let mut count = 0usize;
+                    let mut ok = true;
+                    let mut start = newline + 1;
+                    let mut at = start;
+                    let (mut ends, mut quotes) = window(buf.add(at));
+                    loop {
+                        let mut shift = start - at;
+                        let mut rest = if shift < 64 { ends >> shift } else { 0 };
+                        if rest == 0 {
+                            at = start;
+                            (ends, quotes) = window(buf.add(at));
+                            shift = 0;
+                            rest = ends;
+                        }
+                        let (stop, fine, opens) = if rest != 0 {
+                            let length = rest.trailing_zeros();
+                            let inside = (quotes >> shift) & ((1u64 << length) - 1);
+                            let opens = inside & 1;
+                            let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
+                            (
+                                start + length as usize,
+                                inside == wanted && (opens == 0 || length >= 2),
+                                opens as usize,
+                            )
+                        } else {
+                            ends = 0;
+                            long_field(buf, start)
+                        };
+                        ok &= fine;
+                        if count < N {
+                            fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+                        }
+                        count += 1;
+                        if *buf.add(stop) == b'\n' {
+                            newline = stop;
+                            break;
+                        }
+                        start = stop + 1;
                     }
-                    let (stop, fine, opens) = if rest != 0 {
-                        let length = rest.trailing_zeros();
-                        let inside = (quotes >> shift) & ((1u64 << length) - 1);
-                        let opens = inside & 1;
-                        let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
-                        (
-                            start + length as usize,
-                            inside == wanted && (opens == 0 || length >= 2),
-                            opens as usize,
-                        )
-                    } else {
-                        ends = 0;
-                        long_field(buf, start)
-                    };
-                    ok &= fine;
-                    if count < N {
-                        fields[count] = ((start + opens) as u32, (stop - opens) as u32);
-                    }
-                    count += 1;
-                    if *buf.add(stop) == b'\n' {
-                        newline = stop;
-                        break;
-                    }
-                    start = stop + 1;
+                    well_formed = ok && count == N;
                 }
-                if ok && count == N {
+                if well_formed {
                     visit(buf, &fields);
                 }
             }
