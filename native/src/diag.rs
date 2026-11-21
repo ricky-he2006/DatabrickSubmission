@@ -1,10 +1,14 @@
-//! A diagnostic run, switched on by `SS_DIAG`. It describes the machine, then
-//! times the pipeline as child processes under different tunables, with the
-//! input parsed several times over to reach the size of a scored run. It exits
-//! non-zero on purpose: the scorer only shows logs for a failed dev run.
+//! A diagnostic run, switched on by `SS_DIAG`. It generates a practice-size
+//! dataset with the track's generator, copies it into memory files (shmem,
+//! as the scorer's tmpfs `/data` is), and times the pipeline on it as child
+//! processes: thread counts, floors (read only, split only, decode only), and
+//! CPU time, faults and cgroup throttling per run. It exits non-zero on
+//! purpose: the scorer only shows the log of a failed dev run, and only its
+//! end, so the most important lines come last.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -12,99 +16,97 @@ fn read(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_default().trim().to_string()
 }
 
-fn field(text: &str, key: &str) -> String {
-    text.lines()
-        .find(|line| line.starts_with(key))
-        .map(|line| line.split_once(':').map_or(line, |pair| pair.1).trim().to_string())
-        .unwrap_or_default()
-}
-
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
-    fn mmap(a: *mut std::ffi::c_void, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut std::ffi::c_void;
-    fn munmap(a: *mut std::ffi::c_void, l: usize) -> i32;
-    fn mincore(a: *mut std::ffi::c_void, l: usize, v: *mut u8) -> i32;
-    fn madvise(a: *mut std::ffi::c_void, l: usize, advice: i32) -> i32;
+    fn memfd_create(name: *const u8, flags: u32) -> i32;
 }
 
-/// (bytes, bytes in the page cache) of every CSV under `folder`.
+/// Copies every file under `from` into a memory file and mirrors the tree
+/// under `to` as symlinks to `/proc/self/fd/N`: the fds are inherited, so a
+/// child opening the link opens its own copy of the memory file. Returns bytes.
 #[cfg(target_os = "linux")]
-fn resident(folder: &std::path::Path) -> (u64, u64) {
-    use std::os::fd::AsRawFd;
-    let (mut total, mut cached) = (0u64, 0u64);
-    let Ok(entries) = fs::read_dir(folder) else {
-        return (0, 0);
+fn into_memory(from: &std::path::Path, to: &std::path::Path, keep: &mut Vec<fs::File>) -> u64 {
+    let _ = fs::create_dir_all(to);
+    let mut total = 0;
+    let Ok(entries) = fs::read_dir(from) else {
+        return 0;
     };
     for entry in entries.flatten() {
-        let Ok(file) = fs::File::open(entry.path()) else {
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            total += into_memory(&path, &target, keep);
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
             continue;
         };
-        let size = file.metadata().map_or(0, |meta| meta.len()) as usize;
-        if size == 0 {
+        let fd = unsafe { memfd_create(b"ss\0".as_ptr(), 0) };
+        if fd < 0 {
             continue;
         }
-        unsafe {
-            let map = mmap(std::ptr::null_mut(), size, 1, 2, file.as_raw_fd(), 0);
-            if map as usize == usize::MAX {
-                continue;
-            }
-            let pages = size.div_ceil(4096);
-            let mut seen = vec![0u8; pages];
-            if mincore(map, size, seen.as_mut_ptr()) == 0 {
-                total += size as u64;
-                cached += seen.iter().filter(|&&page| page & 1 != 0).count() as u64 * 4096;
-            }
-            munmap(map, size);
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        if file.write_all(&bytes).is_err() {
+            continue;
         }
+        total += bytes.len() as u64;
+        let _ = std::os::unix::fs::symlink(format!("/proc/self/fd/{fd}"), &target);
+        let _ = fs::remove_file(&path);
+        keep.push(file);
     }
-    (total, cached)
+    total
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resident(_folder: &std::path::Path) -> (u64, u64) {
-    (0, 0)
+fn into_memory(_from: &std::path::Path, _to: &std::path::Path, _keep: &mut Vec<fs::File>) -> u64 {
+    0
 }
 
-/// Milliseconds to first-touch `megabytes` of fresh memory, on `threads` threads.
-#[cfg(target_os = "linux")]
-fn touch(megabytes: usize, threads: usize, advice: i32) -> f64 {
-    let bytes = megabytes << 20;
+/// Wall ms for `threads` threads to each run the same multiply-bound loop:
+/// flat up to the number of whole cores, then up to 2x where two threads
+/// share a core, and worse where the CPU quota throttles.
+fn spin(threads: usize) -> f64 {
     let began = Instant::now();
     std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(move || unsafe {
-                let map = mmap(std::ptr::null_mut(), bytes, 3, 0x22, -1, 0);
-                if map as usize == usize::MAX {
-                    return;
+        for seed in 0..threads {
+            scope.spawn(move || {
+                // 32 independent lanes: enough to fill the multiply ports of a
+                // core whether or not the compiler vectorizes them.
+                let mut x = [0u64; 32];
+                for (lane, value) in x.iter_mut().enumerate() {
+                    *value = (seed * 32 + lane) as u64 | 1;
                 }
-                if advice != 0 {
-                    madvise(map, bytes, advice);
+                for _ in 0..10_000_000u64 {
+                    for value in x.iter_mut() {
+                        *value = value.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                    }
                 }
-                let base = map as *mut u8;
-                let mut at = 0;
-                while at < bytes {
-                    base.add(at).write_volatile(1);
-                    at += 4096;
-                }
-                munmap(map, bytes);
+                std::hint::black_box(x);
             });
         }
     });
     began.elapsed().as_secs_f64() * 1000.0
 }
 
-#[cfg(not(target_os = "linux"))]
-fn touch(_megabytes: usize, _threads: usize, _advice: i32) -> f64 {
-    0.0
+/// (times throttled, ms throttled) by the cgroup so far.
+fn throttled() -> (i64, i64) {
+    let stat = read("/sys/fs/cgroup/cpu.stat");
+    let get = |key: &str| {
+        stat.lines()
+            .find_map(|line| line.strip_prefix(key)?.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    (get("nr_throttled"), get("throttled_usec") / 1000)
 }
 
 struct Timing {
     real: f64,
-    phases: String,
+    detail: String,
 }
 
 fn child(settings: &[(&str, String)]) -> Timing {
     let exe = std::env::current_exe().unwrap();
+    let before = throttled();
     let began = Instant::now();
     let mut command = Command::new(exe);
     command
@@ -119,18 +121,31 @@ fn child(settings: &[(&str, String)]) -> Timing {
     let _ = process.stderr.take().unwrap().read_to_string(&mut log);
     let status = process.wait();
     let real = began.elapsed().as_secs_f64() * 1000.0;
+    let after = throttled();
     // "setup=0.008 parse=0.150 ..." -> "8 150 ...", in milliseconds.
-    let line = log.lines().rev().find(|line| line.contains("total=")).unwrap_or("");
-    let mut phases: String = line
+    let phases = log
+        .lines()
+        .rev()
+        .find(|line| line.contains("total="))
+        .unwrap_or("")
         .split_whitespace()
         .filter_map(|part| part.split_once('=')?.1.parse::<f64>().ok())
         .map(|seconds| format!("{:.0}", seconds * 1000.0))
         .collect::<Vec<_>>()
         .join(" ");
+    let cpu = log
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("cpu= "))
+        .unwrap_or("")
+        .rsplit_once(" sink")
+        .map_or("", |pair| pair.0)
+        .to_string();
+    let mut detail = format!("{phases} | {cpu} th={}/{}", after.0 - before.0, after.1 - before.1);
     if !status.is_ok_and(|status| status.success()) {
-        phases = format!("FAILED {}", log.lines().last().unwrap_or(""));
+        detail = format!("FAILED {}", log.lines().last().unwrap_or(""));
     }
-    Timing { real, phases }
+    Timing { real, detail }
 }
 
 pub fn run() -> ! {
@@ -141,158 +156,83 @@ pub fn run() -> ! {
         .ok()
         .and_then(|at| at.elapsed().ok())
         .map_or(-1.0, |age| age.as_secs_f64() * 1000.0);
-    let data = std::path::PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
-    let (events, events_cached) = resident(&data.join("events"));
-    let (clicks, clicks_cached) = resident(&data.join("clicks"));
-
-    let cpu = read("/proc/cpuinfo");
-    let flags = field(&cpu, "flags");
-    let wanted = [
-        "avx2",
-        "bmi2",
-        "avx512f",
-        "avx512bw",
-        "avx512vl",
-        "avx512vbmi",
-        "avx512_vbmi2",
-        "gfni",
-        "pdpe1gb",
-    ];
-    let have: Vec<&str> = wanted
+    let cpus = std::thread::available_parallelism().map_or(0, usize::from);
+    let affinity = read("/sys/fs/cgroup/cpuset.cpus.effective");
+    let spins: Vec<String> = [1usize, 2, 4, 6, 8, 12, 16]
         .iter()
-        .copied()
-        .filter(|flag| flags.split(' ').any(|have| have == *flag))
+        .map(|&threads| format!("{threads}:{:.0}", spin(threads)))
         .collect();
-    let cache = |index: usize| read(&format!("/sys/devices/system/cpu/cpu0/cache/index{index}/size"));
-    let meminfo = read("/proc/meminfo");
-    let mounts: Vec<String> = read("/proc/self/mountinfo")
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(' ').collect();
-            let dash = parts.iter().position(|part| *part == "-")?;
-            let point = *parts.get(4)?;
-            ["/", "/data", "/output", "/scratch"]
-                .contains(&point)
-                .then(|| format!("{point}={}", parts.get(dash + 1).unwrap_or(&"?")))
-        })
-        .collect();
-    let mut head = Vec::new();
-    head.push(format!(
-        "cpu={} | n={} mhz={} | {}",
-        field(&cpu, "model name"),
-        std::thread::available_parallelism().map_or(0, usize::from),
-        field(&cpu, "cpu MHz"),
-        have.join(",")
-    ));
-    head.push(format!(
-        "cache L1d={} L2={} L3={} | sib0={} | kernel={}",
-        cache(0),
-        cache(2),
-        cache(3),
-        read("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"),
-        read("/proc/sys/kernel/osrelease")
-    ));
-    head.push(format!(
-        "thp={} | defrag={} | cpu.max={} | mem.max={}",
-        read("/sys/kernel/mm/transparent_hugepage/enabled"),
-        read("/sys/kernel/mm/transparent_hugepage/defrag"),
-        read("/sys/fs/cgroup/cpu.max"),
-        read("/sys/fs/cgroup/memory.max")
-    ));
-    head.push(format!(
-        "MemTotal={} MemFree={} Cached={} | fs {}",
-        field(&meminfo, "MemTotal"),
-        field(&meminfo, "MemFree"),
-        field(&meminfo, "Cached"),
-        mounts.join(" ")
-    ));
-    head.push(format!(
-        "input MB events={} cached={} clicks={} cached={}",
-        events >> 20,
-        events_cached >> 20,
-        clicks >> 20,
-        clicks_cached >> 20
-    ));
-    head.push(format!(
-        "touch 256MB ms: 1thr 4k={:.0} huge={:.0} populate={:.0} | 8thr 4k={:.0} huge={:.0} populate={:.0}",
-        touch(256, 1, 0),
-        touch(256, 1, 14),
-        touch(256, 1, 23),
-        touch(256, 8, 0),
-        touch(256, 8, 14),
-        touch(256, 8, 23)
-    ));
-    head.push(format!("ms from container created to our main: {created:.0}"));
-    for line in &head {
-        eprintln!("{line}");
-    }
 
-    // Enough copies of the dev set to parse about as many bytes as a 20M-event run.
-    let copies = (1_800u64 << 20)
-        .div_ceil((events + clicks).max(1))
-        .clamp(1, 60)
-        .to_string();
-    let scaled = |extra: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
-        let mut settings = vec![("SS_COPIES", copies.clone())];
+    // A practice-size dataset (20M events, 5M clicks), from the track's own
+    // generator, then moved into memory.
+    let scratch = std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into());
+    let raw = std::path::PathBuf::from(format!("{scratch}/raw20"));
+    let big = std::path::PathBuf::from(format!("{scratch}/m20"));
+    let events: u64 = std::env::var("SS_DIAG_EVENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000_000);
+    let generating = Instant::now();
+    let generated = Command::new("/app/generate")
+        .args(["--seed", "7", "--events", &events.to_string(), "--clicks", &(events / 4).to_string(), "--output"])
+        .arg(&raw)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let generate_s = generating.elapsed().as_secs_f64();
+    let copying = Instant::now();
+    let mut keep = Vec::new();
+    let megabytes = into_memory(&raw, &big, &mut keep) >> 20;
+    let copy_s = copying.elapsed().as_secs_f64();
+    let big = big.to_string_lossy().to_string();
+
+    let on = |extra: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+        let mut settings = vec![("DATA_DIR", big.clone()), ("OUTPUT_DIR", format!("{scratch}/out"))];
         settings.extend(extra.iter().map(|&(name, value)| (name, value.to_string())));
         settings
     };
-    let variants: Vec<(&str, Vec<(&'static str, String)>)> = vec![
-        ("dev", vec![]),
-        ("base", scaled(&[])),
-        ("huge0", scaled(&[("SS_HUGE", "0")])),
-        ("pop1", scaled(&[("SS_POPULATE", "1")])),
-        ("pop1huge0", scaled(&[("SS_POPULATE", "1"), ("SS_HUGE", "0")])),
-        ("map0", scaled(&[("SS_MAP", "0")])),
-        ("rel0", scaled(&[("SS_RELEASE", "0")])),
-        ("blk256k", scaled(&[("SS_BLOCK", "262144")])),
-        ("blk1m", scaled(&[("SS_BLOCK", "1048576")])),
-        ("blk4m", scaled(&[("SS_BLOCK", "4194304")])),
-        ("id9", scaled(&[("SS_ID_BITS", "9")])),
-        ("id10", scaled(&[("SS_ID_BITS", "10")])),
-        ("id12", scaled(&[("SS_ID_BITS", "12")])),
-        ("id13", scaled(&[("SS_ID_BITS", "13")])),
-        ("pb9", scaled(&[("SS_PERSON_BITS", "9")])),
-        ("pb10", scaled(&[("SS_PERSON_BITS", "10")])),
-        ("pb12", scaled(&[("SS_PERSON_BITS", "12")])),
-        ("pb13", scaled(&[("SS_PERSON_BITS", "13")])),
-        ("ahead8", scaled(&[("SS_AHEAD", "8")])),
-        ("ahead32", scaled(&[("SS_AHEAD", "32")])),
-        ("ahead64", scaled(&[("SS_AHEAD", "64")])),
-        ("ncpu1", scaled(&[("NCPU", "1")])),
-        ("ncpu4", scaled(&[("NCPU", "4")])),
-        ("ncpu6", scaled(&[("NCPU", "6")])),
-        ("ncpu12", scaled(&[("NCPU", "12")])),
-        ("ncpu16", scaled(&[("NCPU", "16")])),
-        (
-            "x3",
-            vec![("SS_COPIES", (copies.parse::<u64>().unwrap() * 3).min(100).to_string())],
-        ),
+    let _ = fs::create_dir_all(format!("{scratch}/out/user_daily"));
+    let _ = fs::create_dir_all(format!("{scratch}/out/campaign_daily"));
+    let variants: Vec<(&str, usize, Vec<(&'static str, String)>)> = vec![
+        ("dev", 2, vec![("OUTPUT_DIR", format!("{scratch}/out"))]),
+        ("base", 3, on(&[])),
+        ("n12", 3, on(&[("NCPU", "12")])),
+        ("n16", 2, on(&[("NCPU", "16")])),
+        ("n4", 2, on(&[("NCPU", "4")])),
+        ("n2", 1, on(&[("NCPU", "2")])),
+        ("n1", 1, on(&[("NCPU", "1")])),
+        ("map0", 2, on(&[("SS_MAP", "0")])),
+        ("rd", 2, on(&[("SS_MODE", "1")])),
+        ("split", 2, on(&[("SS_MODE", "2")])),
+        ("dec", 2, on(&[("SS_MODE", "3")])),
+        ("1rd", 1, on(&[("SS_MODE", "1"), ("NCPU", "1")])),
+        ("1split", 1, on(&[("SS_MODE", "2"), ("NCPU", "1")])),
+        ("1dec", 1, on(&[("SS_MODE", "3"), ("NCPU", "1")])),
+        ("4dec", 1, on(&[("SS_MODE", "3"), ("NCPU", "4")])),
+        ("base", 3, on(&[])),
     ];
 
-    let first = child(&[]);
-    let mut table = vec![format!("first-dev {:.0} | {}", first.real, first.phases)];
-    for (name, settings) in &variants {
+    let mut table: Vec<String> = Vec::new();
+    for (name, runs, settings) in &variants {
         // Leave room inside the dev run's three minutes.
-        if began.elapsed().as_secs() > 110 {
+        if began.elapsed().as_secs() > 120 {
             table.push(format!("{name} skipped"));
             continue;
         }
-        let runs = if ["ncpu1", "x3"].contains(name) { 1 } else { 3 };
-        let mut all: Vec<Timing> = (0..runs).map(|_| child(settings)).collect();
-        all.sort_by(|a, b| a.real.total_cmp(&b.real));
+        let mut all: Vec<Timing> = (0..*runs).map(|_| child(settings)).collect();
         let reals: Vec<String> = all.iter().map(|timing| format!("{:.0}", timing.real)).collect();
-        table.push(format!("{name} {} | {}", reals.join("/"), all[0].phases));
+        all.sort_by(|a, b| a.real.total_cmp(&b.real));
+        table.push(format!("{name} {} | {}", reals.join("/"), all[0].detail));
     }
 
-    eprintln!("copies={copies}; ms: name real(sorted) | setup parse dedup sessions write links total (best run)");
+    eprintln!("ms real | setup parse dedup sess write links total | u/s ms: setup parse dedup sess write, kfaults, invol | throttled n/ms");
     for line in &table {
         eprintln!("{line}");
     }
-    // Once more at the very end, in case only the tail of the log is shown.
-    for line in &head {
-        eprintln!("{line}");
-    }
+    eprintln!(
+        "gen ok={generated} {generate_s:.1}s copy {megabytes}MB {copy_s:.1}s | cpus={cpus} set={affinity} max={} NCPU={} | start={created:.0}ms",
+        read("/sys/fs/cgroup/cpu.max"),
+        std::env::var("NCPU").unwrap_or_default()
+    );
+    eprintln!("spin ms by threads {}", spins.join(" "));
     eprintln!("diag took {:.1}s; exiting 1 on purpose", began.elapsed().as_secs_f64());
     std::process::exit(1);
 }

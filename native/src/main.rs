@@ -413,6 +413,25 @@ pub fn huge<T>(start: *const T, count: usize) {
 pub static HUGE: AtomicUsize = AtomicUsize::new(1);
 /// How long the one thread that builds the links table spent on it.
 static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
+/// Diagnostic floors: 1 reads the input only, 2 also splits it into lines,
+/// 3 also decodes every field but keeps nothing.
+static MODE: AtomicUsize = AtomicUsize::new(0);
+static SINK: AtomicUsize = AtomicUsize::new(0);
+
+/// (user ms, system ms, minor faults, involuntary switches) so far.
+fn usage() -> [i64; 4] {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+        }
+        let mut raw = [0i64; 18];
+        getrusage(0, &mut raw);
+        [raw[0] * 1000 + raw[1] / 1000, raw[2] * 1000 + raw[3] / 1000, raw[8], raw[17]]
+    }
+    #[cfg(not(target_os = "linux"))]
+    [0; 4]
+}
 pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
 
 /// With `POPULATE` on: when `count` values at `start` begin a new 2 MB stretch,
@@ -589,6 +608,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     let ingest_base = window_start - 10 * DAY;
+    let decode_only = MODE.load(Ordering::Relaxed) == 3;
+    let mut kept = 0usize;
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -639,8 +660,15 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
+        if decode_only {
+            kept = kept.wrapping_add((record.id ^ record.user) as usize ^ record.payload as usize ^ record.ts as usize);
+            return;
+        }
         out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
     });
+    if decode_only {
+        SINK.fetch_add(kept, Ordering::Relaxed);
+    }
 }
 
 fn parse_clicks(
@@ -654,6 +682,8 @@ fn parse_clicks(
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
     pending.clear();
+    let decode_only = MODE.load(Ordering::Relaxed) == 3;
+    let mut kept = 0usize;
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -671,6 +701,10 @@ fn parse_clicks(
         if campaign == 0 || at < earliest || at >= window_end {
             return;
         }
+        if decode_only {
+            kept = kept.wrapping_add((id ^ user) as usize ^ campaign as usize);
+            return;
+        }
         pending.push(RawClick {
             user,
             id,
@@ -678,6 +712,10 @@ fn parse_clicks(
             campaign,
         });
     });
+    if decode_only {
+        SINK.fetch_add(kept, Ordering::Relaxed);
+        return;
+    }
     let links = loop {
         match shared.links.get() {
             Some(links) => break links,
@@ -704,7 +742,7 @@ fn parse_clicks(
 
 fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Buckets<Click>)> {
     let mut block = Block::new();
-    if first {
+    if first && MODE.load(Ordering::Relaxed) == 0 {
         // The other threads wait on this table, so a failure must not leave them waiting.
         let began = Instant::now();
         let links = read_links(shared, &mut block).unwrap_or_else(|error| {
@@ -720,6 +758,28 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
+        let mode = MODE.load(Ordering::Relaxed);
+        if mode == 1 {
+            let mut sum = 0usize;
+            let (base, len) = block.span();
+            let mut at = 0;
+            while at < len {
+                sum = sum.wrapping_add(unsafe { base.add(at).read_volatile() } as usize);
+                at += 64;
+            }
+            SINK.fetch_add(sum, Ordering::Relaxed);
+            continue;
+        }
+        if mode == 2 {
+            let mut count = 0usize;
+            if work.events {
+                block.raw_lines::<7>(|_, start, seps| count += (start ^ seps[6]) as usize);
+            } else {
+                block.raw_lines::<4>(|_, start, seps| count += (start ^ seps[3]) as usize);
+            }
+            SINK.fetch_add(count, Ordering::Relaxed);
+            continue;
+        }
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
@@ -1246,6 +1306,8 @@ fn main() -> io::Result<()> {
     let map = tune("SS_MAP", 1) != 0;
     let give_back = tune("SS_RELEASE", 1) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
+    MODE.store(tune("SS_MODE", 0) as usize, Ordering::Relaxed);
+    let mut marks = vec![usage()];
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = std::env::var("NCPU")
@@ -1370,6 +1432,7 @@ fn main() -> io::Result<()> {
     fs::create_dir_all(shared.output.join("campaign_daily"))?;
     let shared = &shared;
     let setup = began.elapsed();
+    marks.push(usage());
 
     let parsed: Vec<(Buckets<Parsed>, Buckets<Click>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -1382,6 +1445,28 @@ fn main() -> io::Result<()> {
     })?;
     let (parsed_events, clicks): (Vec<_>, Vec<_>) = parsed.into_iter().unzip();
     let parse = began.elapsed();
+    marks.push(usage());
+    if MODE.load(Ordering::Relaxed) != 0 {
+        // A floor: no links table, and nothing after parsing.
+        let (a, b, c) = (marks[0], marks[1], marks[2]);
+        eprintln!(
+            "cpu= {}/{} {}/{} f={} iv={} sink={}",
+            b[0] - a[0],
+            b[1] - a[1],
+            c[0] - b[0],
+            c[1] - b[1],
+            (c[2] - a[2]) / 1000,
+            c[3] - a[3],
+            SINK.load(Ordering::Relaxed) & 1
+        );
+        eprintln!(
+            "setup={:.3} parse={:.3} total={:.3}",
+            setup.as_secs_f64(),
+            (parse - setup).as_secs_f64(),
+            parse.as_secs_f64()
+        );
+        std::process::exit(0);
+    }
 
     let next = AtomicUsize::new(0);
     let events: Vec<Buckets<Event>> = std::thread::scope(|scope| {
@@ -1391,6 +1476,7 @@ fn main() -> io::Result<()> {
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     let dedup = began.elapsed();
+    marks.push(usage());
     let parsed_events = &parsed_events;
 
     // Biggest person buckets first, so a whale's is never the last one running.
@@ -1417,6 +1503,7 @@ fn main() -> io::Result<()> {
             .collect::<io::Result<Vec<_>>>()
     })?;
     let sessions = began.elapsed();
+    marks.push(usage());
 
     if !results.iter().any(|result| result.1) {
         let path = shared.output.join("user_daily").join("part-000.parquet");
@@ -1493,6 +1580,21 @@ fn main() -> io::Result<()> {
         }
     });
     let total = began.elapsed();
+    marks.push(usage());
+    // Per phase (setup parse dedup sessions write): user/system ms, then
+    // thousands of minor faults and involuntary switches over the whole run.
+    let mut cpu = Vec::new();
+    for pair in marks.windows(2) {
+        cpu.push(format!("{}/{}", pair[1][0] - pair[0][0], pair[1][1] - pair[0][1]));
+    }
+    let (first, last) = (marks[0], marks[marks.len() - 1]);
+    eprintln!(
+        "cpu= {} f={} iv={} sink={}",
+        cpu.join(" "),
+        (last[2] - first[2]) / 1000,
+        last[3] - first[3],
+        SINK.load(Ordering::Relaxed) & 1
+    );
     eprintln!(
         "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
         setup.as_secs_f64(),

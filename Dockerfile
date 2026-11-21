@@ -24,6 +24,17 @@ RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && 
       cargo build --locked --release --target "$target" && \
     cp "target/$target/release/shopping-sessions" /shopping-sessions
 
+# Diagnostic branch only: the track's generator (no dependencies), to
+# benchmark on practice-size data on the scorer.
+COPY gen/ /gen/
+RUN cd /gen && target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
+    if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
+    RUSTFLAGS="-C linker=$linker" cargo build --locked --release --target "$target" && \
+    cp "target/$target/release/generate" /generate
+
 FROM debian:bookworm-slim
+COPY --from=builder /generate /app/generate
 COPY --from=builder /shopping-sessions /app/shopping-sessions
 CMD ["/app/shopping-sessions"]
+# Diagnostic branch only: benchmark on the scorer, print the results, exit 1.
+ENV SS_DIAG=1

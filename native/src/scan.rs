@@ -319,6 +319,11 @@ impl Block {
         }
     }
 
+    /// The block's bytes: where they start, and how many.
+    pub fn span(&self) -> (*const u8, usize) {
+        (self.base, self.end)
+    }
+
     pub fn load(&mut self, source: &Source, start: u64, end: u64) -> io::Result<()> {
         let own = (end - start) as usize;
         self.own_end = own;
