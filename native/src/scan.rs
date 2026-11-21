@@ -90,6 +90,13 @@ fn fetch(target: *const u8) {
     let _ = target;
 }
 
+pub static POPULATE_FAILED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static POPULATE_ERRNO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn __errno_location() -> *mut i32;
+}
+
 pub struct Block {
     buf: Vec<u8>,
     base: *const u8,
@@ -217,7 +224,10 @@ impl Block {
             #[cfg(target_os = "linux")]
             unsafe {
                 let from = self.base as usize & !4095;
-                madvise(from as *mut _, self.base as usize + own + 4096 - from, 22);
+                if madvise(from as *mut _, self.base as usize + own + 4096 - from, 22) != 0 {
+                    POPULATE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    POPULATE_ERRNO.store(*__errno_location() as usize, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             let tail = unsafe { std::slice::from_raw_parts(self.base.add(own), SLACK - 4 * PAD) };
             if let Some(at) = tail.iter().position(|&byte| byte == b'\n') {

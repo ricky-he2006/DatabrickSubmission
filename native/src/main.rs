@@ -404,7 +404,9 @@ pub fn huge<T>(start: *const T, count: usize) {
         let from = (start as usize + 4095) & !4095;
         let to = (start as usize + bytes) & !4095;
         if to > from + (1 << 21) && HUGE.load(Ordering::Relaxed) != 0 {
-            madvise(from as *mut _, to - from, MADV_HUGEPAGE);
+            if madvise(from as *mut _, to - from, MADV_HUGEPAGE) != 0 {
+                scan::POPULATE_FAILED.fetch_add(1 << 32, Ordering::Relaxed);
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -1533,6 +1535,14 @@ fn main() -> io::Result<()> {
     });
     let total = began.elapsed();
     let used = usage();
+    {
+        let failed = scan::POPULATE_FAILED.load(Ordering::Relaxed);
+        let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let pick = |key: &str| status.lines().find(|line| line.starts_with(key)).map_or(String::new(), |line| line.split_whitespace().nth(1).unwrap_or("").to_string());
+        let smaps = fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let roll = |key: &str| smaps.lines().find(|line| line.starts_with(key)).map_or(String::new(), |line| line.split_whitespace().nth(1).unwrap_or("").to_string());
+        eprint!("popfail={} errno={} hugefail={} hwm={} anonhuge={} rss={} ", failed & 0xFFFF_FFFF, scan::POPULATE_ERRNO.load(Ordering::Relaxed), failed >> 32, pick("VmHWM:"), roll("AnonHugePages:"), roll("Rss:"));
+    }
     eprintln!(
         "cpu parse={:.2}+{:.2} dedup={:.2}+{:.2} sessions={:.2}+{:.2} end={:.2}+{:.2} kfaults={:.0} kblocks={:.1} linkread={:.3}",
         used_parse[0] - used_setup[0],
