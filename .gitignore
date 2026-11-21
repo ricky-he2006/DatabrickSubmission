@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
-work/
+out/
+dev/
+ref/
+dev-answer/
+target/

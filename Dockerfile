@@ -1,3 +1,7 @@
+# Shopping Sessions: one Rust binary with no crate dependencies.
+# The scorers build this natively on linux/amd64; on an Apple-silicon Mac the
+# builder stage cross-compiles, so `docker buildx build --platform linux/amd64`
+# stays fast there too.
 FROM --platform=$BUILDPLATFORM rust:1.85-slim-bookworm AS builder
 ARG BUILDARCH
 ARG TARGETARCH
@@ -12,11 +16,14 @@ RUN case "$TARGETARCH" in \
     fi && \
     rustup target add "$target" && printf '%s\n%s\n' "$target" "$linker" > /target-info
 COPY native/ ./
+# x86-64-v3 (AVX2, BMI2): every scorer machine is Cascade Lake or newer.
 RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
     if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
-    case "$TARGETARCH" in amd64) cpu=x86-64-v4 ;; arm64) cpu=generic ;; esac && \
-    RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu" cargo build --locked --release --target "$target" && \
+    case "$TARGETARCH" in amd64) cpu=x86-64-v3 ;; arm64) cpu=generic ;; esac && \
+    RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu" \
+      cargo build --locked --release --target "$target" && \
     cp "target/$target/release/shopping-sessions" /shopping-sessions
+
 FROM debian:bookworm-slim
-COPY --from=builder /shopping-sessions /app/native
-CMD ["/app/native"]
+COPY --from=builder /shopping-sessions /app/shopping-sessions
+CMD ["/app/shopping-sessions"]

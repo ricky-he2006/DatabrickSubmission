@@ -1,5 +1,12 @@
 fixtures/
 dev/
 out/
+ref/
+dev-answer/
+tools/
 *.md
 .git
+__pycache__/
+*.pyc
+work/
+**/target/
