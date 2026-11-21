@@ -286,7 +286,6 @@ impl Block {
             };
             while newline < own_end && newline + 1 < end {
                 fetch(buf.wrapping_add(newline + READ_AHEAD));
-                fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
                 let mut fields = [(0u32, 0u32); N];
                 let mut count = 0usize;
                 let mut ok = true;
