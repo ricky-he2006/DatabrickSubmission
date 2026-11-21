@@ -1,6 +1,4 @@
 base|base|
-main|main|
-avx512-cursor|avx512-cursor|
-xeon-alu-opt|xeon-alu-opt|
-opt-1a-clean|opt-1a-clean|
-sub-300ms|sub-300ms|
+links|links|
+1:base|base|NCPU=1
+1:links|links|NCPU=1

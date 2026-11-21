@@ -269,11 +269,20 @@ impl Dim {
     }
 }
 
-/// user ID -> person, for every ID that a link names.
+/// user ID -> person, for every ID that a link names and that is not its
+/// person's name: a lookup that finds nothing means the ID names itself.
+/// Sized to what it holds, not to a power of two, so it stays small enough to
+/// keep in cache: every event looks its user up here.
 struct Links {
     slots: Vec<[u64; 2]>,
-    shift: u32,
+    capacity: u64,
     empty: bool,
+}
+
+/// `hash` mapped onto `0..capacity`.
+#[inline(always)]
+fn reduce(hash: u64, capacity: u64) -> usize {
+    ((hash as u128 * capacity as u128) >> 64) as usize
 }
 
 impl Links {
@@ -347,27 +356,40 @@ impl Links {
                 smallest[root] = name;
             }
         }
-        for at in 0..slots.len() {
-            if at + 16 < slots.len() && slots[at + 16][0] != 0 {
-                prefetch(&parent[slots[at + 16][1] as usize]);
+        let mut moved: Vec<[u64; 2]> = Vec::with_capacity(names.len());
+        for (id, &name) in names.iter().enumerate() {
+            if id + 16 < names.len() {
+                prefetch(&parent[id + 16]);
             }
-            let entry = &mut slots[at];
-            if entry[0] != 0 {
-                // After the pass above every ID is at most one step from its root.
-                entry[1] = smallest[find(&mut parent, entry[1] as u32) as usize];
+            // After the pass above every ID is at most one step from its root.
+            let person = smallest[find(&mut parent, id as u32) as usize];
+            if person != name {
+                moved.push([name, person]);
             }
+        }
+        release(slots.as_ptr(), slots.len());
+        drop(slots);
+        let capacity = (moved.len() as u64 * 2).max(16);
+        let mut slots = vec![[0u64; 2]; capacity as usize];
+        huge(slots.as_ptr(), slots.len());
+        for &[key, person] in &moved {
+            let mut slot = reduce(key.wrapping_mul(MIX), capacity);
+            while slots[slot][0] != 0 {
+                slot = if slot + 1 == capacity as usize { 0 } else { slot + 1 };
+            }
+            slots[slot] = [key, person];
         }
         Self {
             slots,
-            shift,
-            empty: pairs.is_empty(),
+            capacity,
+            empty: moved.is_empty(),
         }
     }
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
         if !self.empty {
-            prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
+            prefetch(unsafe { self.slots.get_unchecked(reduce(key.wrapping_mul(MIX), self.capacity)) });
         }
     }
 
@@ -376,8 +398,7 @@ impl Links {
         if self.empty {
             return key;
         }
-        let mask = self.slots.len() - 1;
-        let mut slot = (key.wrapping_mul(MIX) >> self.shift) as usize;
+        let mut slot = reduce(key.wrapping_mul(MIX), self.capacity);
         loop {
             let entry = unsafe { self.slots.get_unchecked(slot) };
             if entry[0] == key {
@@ -386,7 +407,7 @@ impl Links {
             if entry[0] == 0 {
                 return key;
             }
-            slot = (slot + 1) & mask;
+            slot = if slot + 1 == self.capacity as usize { 0 } else { slot + 1 };
         }
     }
 }
