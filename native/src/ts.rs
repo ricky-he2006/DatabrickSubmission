@@ -121,7 +121,10 @@ unsafe fn civil_seconds(p: *const u8, dates: &mut Dates) -> i64 {
         // Digits become 0..=9 and separators 0; anything else is over `most`.
         let digits = _mm_xor_si128(text, template);
         let over = _mm_subs_epu8(digits, most);
-        let pairs = _mm_shuffle_epi8(digits, _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1));
+        let pairs = _mm_shuffle_epi8(
+            digits,
+            _mm_setr_epi8(4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1),
+        );
         // 16-bit day, hour, minute, second.
         let parts = _mm_maddubs_epi16(pairs, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0));
         let late = _mm_cmpgt_epi16(parts, _mm_setr_epi16(99, 23, 59, 59, 0, 0, 0, 0));
