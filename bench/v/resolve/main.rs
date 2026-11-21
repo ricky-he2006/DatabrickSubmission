@@ -641,17 +641,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     });
 }
 
-fn parse_clicks(
-    shared: &Shared,
-    block: &Block,
-    copy: u64,
-    dates: &mut ts::Dates,
-    pending: &mut Vec<RawClick>,
-    out: &mut Buckets<Click>,
-) {
+fn parse_clicks(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut Buckets<Click>) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
-    pending.clear();
+    let bits = shared.person_bits;
     block.lines::<4>(|buf, fields| unsafe {
         let field = |at: usize| (buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize);
         let (p, n) = field(0);
@@ -669,35 +662,17 @@ fn parse_clicks(
         if campaign == 0 || at < earliest || at >= window_end {
             return;
         }
-        pending.push(RawClick {
-            user,
-            id,
-            ts: (at - earliest) as u32,
-            campaign,
-        });
-    });
-    let links = loop {
-        match shared.links.get() {
-            Some(links) => break links,
-            None => std::thread::yield_now(),
-        }
-    };
-    for at in 0..pending.len() {
-        if let Some(ahead) = pending.get(at + shared.ahead) {
-            links.prefetch(ahead.user);
-        }
-        let click = pending[at];
-        let person = links.person(click.user);
+        // The person is looked up later, a partition at a time.
         out.push(
-            person_part(person, shared.person_bits),
+            person_part(user, bits),
             Click {
-                person,
-                id: click.id,
-                ts: click.ts,
-                campaign: click.campaign,
+                person: user,
+                id,
+                ts: (at - earliest) as u32,
+                campaign,
             },
         );
-    }
+    });
 }
 
 fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Buckets<Click>)> {
@@ -714,14 +689,13 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     }
     let mut events = Buckets::new(1 << shared.id_bits);
     let mut clicks = Buckets::new(1 << shared.person_bits);
-    let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &block, work.copy, &mut dates, &mut clicks);
         }
     }
     Ok((events, clicks))
@@ -730,11 +704,10 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
 // ---------------------------------------------------------------- phase 2
 
 fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize) -> Buckets<Event> {
-    let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
-    let (ahead, person_bits) = (shared.ahead, shared.person_bits);
+    let person_bits = shared.person_bits;
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut table: Vec<u32> = Vec::new();
     loop {
@@ -784,18 +757,22 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     }
                 }
             }
+            // The person is looked up later, a partition at a time: for now
+            // `person` holds the user.
             for &(base, count) in &chunks {
                 for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    out.push(
+                        person_part(record.user, person_bits),
+                        Event {
+                            person: record.user,
+                            value,
+                        },
+                    );
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -805,6 +782,72 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         }
     }
     out
+}
+
+// ---------------------------------------------------------------- phase 2b
+
+/// Replaces each user with their person and regroups by the person's partition.
+/// Users come a partition at a time, and the links table puts a key's slot by
+/// the same top bits of the same hash: each partition's lookups stay inside
+/// one small stretch of the table, in cache, where lookups in ID order would
+/// each miss it.
+fn resolve_worker(
+    shared: &Shared,
+    events_in: &[Buckets<Event>],
+    clicks_in: &[Buckets<Click>],
+    next: &AtomicUsize,
+) -> (Buckets<Event>, Buckets<Click>) {
+    let links = shared.links.get().unwrap();
+    let bits = shared.person_bits;
+    let mut events = Buckets::new(1 << bits);
+    let mut clicks = Buckets::new(1 << bits);
+    let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
+    let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
+    loop {
+        let part = next.fetch_add(1, Ordering::Relaxed);
+        if part >= 1 << bits {
+            break;
+        }
+        event_chunks.clear();
+        for source in events_in {
+            source.chunks(part, &mut event_chunks);
+        }
+        unsafe {
+            for &(base, count) in &event_chunks {
+                for offset in 0..count {
+                    let event = *base.add(offset);
+                    let person = links.person(event.person);
+                    events.push(
+                        person_part(person, bits),
+                        Event {
+                            person,
+                            value: event.value,
+                        },
+                    );
+                }
+            }
+        }
+        for &(base, _) in &event_chunks {
+            events.donate(base as *mut u8);
+        }
+        click_chunks.clear();
+        for source in clicks_in {
+            source.chunks(part, &mut click_chunks);
+        }
+        unsafe {
+            for &(base, count) in &click_chunks {
+                for offset in 0..count {
+                    let mut click = *base.add(offset);
+                    click.person = links.person(click.person);
+                    clicks.push(person_part(click.person, bits), click);
+                }
+            }
+        }
+        for &(base, _) in &click_chunks {
+            clicks.donate(base as *mut u8);
+        }
+    }
+    (events, clicks)
 }
 
 // ---------------------------------------------------------------- phase 3
@@ -873,7 +916,7 @@ impl Sessions<'_> {
         Ok(())
     }
 
-    /// One person: their events and their clicks, each sorted by time.
+    /// One person: their events sorted by time, their clicks by time then ID.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let days = self.shared.days;
         let day_offset = self.shared.day_offset;
@@ -946,15 +989,10 @@ impl Sessions<'_> {
                     low += 1;
                 }
                 if high > low {
-                    // Clicks are in time order only: of the latest, the smallest ID.
                     let latest = clicks[high - 1].ts;
                     let mut pick = high - 1;
-                    let mut at = high - 1;
-                    while at > low && clicks[at - 1].ts == latest {
-                        at -= 1;
-                        if keys::compare(clicks[at].id, clicks[pick].id) == Order::Less {
-                            pick = at;
-                        }
+                    while pick > low && clicks[pick - 1].ts == latest {
+                        pick -= 1;
                     }
                     credited = clicks[pick].campaign as usize;
                 }
@@ -977,55 +1015,33 @@ impl Sessions<'_> {
     }
 }
 
-/// Sorts `items`, and `tags` along with them, by `key` and stably: three
-/// counting passes of 11 bits. `spare` and `spare_tags` are scratch space.
-/// Branch-free, where sorting each person's few events on their own is not.
-fn sort_by_key32<T: Copy>(
-    items: &mut Vec<T>,
-    tags: &mut Vec<u32>,
-    spare: &mut Vec<T>,
-    spare_tags: &mut Vec<u32>,
-    key: impl Fn(&T) -> u32,
-) {
-    let total = items.len();
-    if total < 2 {
-        return;
-    }
-    let mut counts = [[0u32; 2048]; 3];
-    for item in items.iter() {
-        let at = key(item);
-        counts[0][at as usize & 2047] += 1;
-        counts[1][(at >> 11) as usize & 2047] += 1;
-        counts[2][(at >> 22) as usize] += 1;
-    }
-    spare.resize(total, items[0]);
-    spare_tags.resize(total, 0);
-    for (pass, shift) in [0u32, 11, 22].into_iter().enumerate() {
-        let counts = &mut counts[pass];
-        // A digit every item shares orders nothing.
-        if counts[(key(&items[0]) >> shift) as usize & 2047] as usize == total {
-            continue;
+/// Sorts many events of one person by their `ts` (the top 32 bits): three
+/// counting passes of 11 bits. Whales have a million events each.
+fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
+    scratch.clear();
+    scratch.resize(values.len(), 0);
+    let mut counts = [0u32; 2048];
+    let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
+    for shift in [32, 43, 54] {
+        counts.fill(0);
+        for &value in from.iter() {
+            counts[(value >> shift) as usize & 2047] += 1;
         }
-        let mut sum = 0u32;
+        let mut sum = 0;
         for count in counts.iter_mut() {
             let here = *count;
             *count = sum;
             sum += here;
         }
-        unsafe {
-            for at in 0..total {
-                let item = *items.get_unchecked(at);
-                let slot = counts.get_unchecked_mut((key(&item) >> shift) as usize & 2047);
-                *spare.get_unchecked_mut(*slot as usize) = item;
-                *spare_tags.get_unchecked_mut(*slot as usize) = *tags.get_unchecked(at);
-                *slot += 1;
-            }
+        for &value in from.iter() {
+            let slot = &mut counts[(value >> shift) as usize & 2047];
+            to[*slot as usize] = value;
+            *slot += 1;
         }
-        spare.truncate(total);
-        spare_tags.truncate(total);
-        std::mem::swap(items, spare);
-        std::mem::swap(tags, spare_tags);
+        std::mem::swap(&mut from, &mut to);
     }
+    // Three passes: the sorted values are in the scratch buffer.
+    to.copy_from_slice(from);
 }
 
 fn session_worker(
@@ -1059,12 +1075,7 @@ fn session_worker(
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
-    let mut gathered: Vec<u64> = Vec::new();
-    let mut spare_values: Vec<u64> = Vec::new();
-    let mut spare_tags: Vec<u32> = Vec::new();
-    let mut kept_touches: Vec<Touch> = Vec::new();
-    let mut kept_tags: Vec<u32> = Vec::new();
-    let mut spare_touches: Vec<Touch> = Vec::new();
+    let mut scratch: Vec<u64> = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1134,22 +1145,17 @@ fn session_worker(
                 *end = sum;
                 sum += count;
             }
-            // The bucket's events by time, then by person: the stable pass by
-            // person leaves each person's events in time order.
-            gathered.clear();
-            for &(base, count) in &event_chunks {
-                gathered.extend((0..count).map(|offset| (*base.add(offset)).value));
-            }
-            sort_by_key32(&mut gathered, &mut local, &mut spare_values, &mut spare_tags, |value| {
-                (value >> 32) as u32
-            });
             if values.len() < total {
                 values.resize(total, 0);
             }
-            for (&value, &id) in gathered.iter().zip(local.iter()) {
-                let end = ends.get_unchecked_mut(id as usize);
-                *values.get_unchecked_mut(*end as usize) = value;
-                *end += 1;
+            let mut index = 0;
+            for &(base, count) in &event_chunks {
+                for offset in 0..count {
+                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
+                    *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
+                    *end += 1;
+                    index += 1;
+                }
             }
         }
 
@@ -1200,8 +1206,6 @@ fn session_worker(
                     },
                 );
             }
-            kept_touches.clear();
-            kept_tags.clear();
             let mut index = 0;
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
@@ -1209,20 +1213,15 @@ fn session_worker(
                     index += 1;
                     if id != NONE {
                         let click = *base.add(offset);
-                        kept_touches.push(Touch {
+                        let end = click_ends.get_unchecked_mut(id as usize);
+                        *touches.get_unchecked_mut(*end as usize) = Touch {
                             id: click.id,
                             ts: click.ts,
                             campaign: click.campaign,
-                        });
-                        kept_tags.push(id);
+                        };
+                        *end += 1;
                     }
                 }
-            }
-            sort_by_key32(&mut kept_touches, &mut kept_tags, &mut spare_touches, &mut spare_tags, |touch| touch.ts);
-            for (&touch, &id) in kept_touches.iter().zip(kept_tags.iter()) {
-                let end = click_ends.get_unchecked_mut(id as usize);
-                *touches.get_unchecked_mut(*end as usize) = touch;
-                *end += 1;
             }
         }
 
@@ -1230,7 +1229,17 @@ fn session_worker(
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
-            sessions.person(person, &values[from..to], &touches[click_from..click_to])?;
+            let mine = &mut values[from..to];
+            if mine.len() > 2048 {
+                sort_by_time(mine, &mut scratch);
+            } else {
+                mine.sort_unstable();
+            }
+            let reached = &mut touches[click_from..click_to];
+            if reached.len() > 1 {
+                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
+            }
+            sessions.person(person, mine, reached)?;
             from = to;
             click_from = click_to;
         }
@@ -1409,6 +1418,18 @@ fn main() -> io::Result<()> {
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
+    let next = AtomicUsize::new(0);
+    let users = (&events, &clicks);
+    let resolved: Vec<(Buckets<Event>, Buckets<Click>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| scope.spawn(|| resolve_worker(shared, users.0, users.1, &next)))
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    let (unresolved_events, unresolved_clicks) = (events, clicks);
+    let (events, clicks): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    let resolve = began.elapsed();
+
     // Biggest person buckets first, so a whale's is never the last one running.
     let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
     let weight = |part: u32| {
@@ -1493,12 +1514,15 @@ fn main() -> io::Result<()> {
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
             let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let (unresolved_events, unresolved_clicks) = (&unresolved_events, &unresolved_clicks);
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].release();
                 events[thread].release();
                 clicks[thread].release();
+                unresolved_events[thread].release();
+                unresolved_clicks[thread].release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
@@ -1510,11 +1534,12 @@ fn main() -> io::Result<()> {
     });
     let total = began.elapsed();
     eprintln!(
-        "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
+        "setup={:.3} parse={:.3} dedup={:.3} resolve={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
         setup.as_secs_f64(),
         (parse - setup).as_secs_f64(),
         (dedup - parse).as_secs_f64(),
-        (sessions - dedup).as_secs_f64(),
+        (resolve - dedup).as_secs_f64(),
+        (sessions - resolve).as_secs_f64(),
         (total - sessions).as_secs_f64(),
         LINKS_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
         total.as_secs_f64()

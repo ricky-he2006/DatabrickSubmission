@@ -1,4 +1,4 @@
 cur|cur|
-radix|radix|
+resolve|resolve|
 1:cur|cur|NCPU=1
-1:radix|radix|NCPU=1
+1:resolve|resolve|NCPU=1
