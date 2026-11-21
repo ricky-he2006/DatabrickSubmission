@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 jobs:
   bench:
+    if: ${{ !contains(github.event.head_commit.message, '[profile]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     strategy:
@@ -85,6 +86,5 @@ jobs:
           mkdir -p /dev/shm/o
           DATA_DIR=/dev/shm/d2 OUTPUT_DIR=/dev/shm/o NCPU=1 SS_RELEASE=0 valgrind --tool=callgrind --dump-instr=no --callgrind-out-file=/tmp/cg.out target/release/shopping-sessions 2>&1 | tail -5
           callgrind_annotate --auto=yes --threshold=99.9 /tmp/cg.out src/main.rs src/scan.rs src/ts.rs src/keys.rs src/pq.rs > /tmp/ann.txt 2>&1 || true
-          head -60 /tmp/ann.txt
-          echo "=== lines"
-          awk '/^-- Auto-annotated source: /{f=$NF} /^ *[0-9,]+ \( *[0-9.]+%\)/{n=$1; gsub(",","",n); if (n+0 > 15000000) print f": "$0}' /tmp/ann.txt | cut -c1-230
+          grep -E "PROGRAM TOTALS" /tmp/ann.txt
+          grep -n -E "^-- (Auto|User)-annotated source|^ *[0-9]{1,3},[0-9]{3},[0-9]{3} \\(" /tmp/ann.txt | grep -v "file:function" | cut -c1-210
