@@ -60,18 +60,28 @@ struct Part<T> {
 }
 
 /// Records appended to one of many partitions, in fixed chunks carved from
-/// big slabs: no copying on growth, and a chunk never moves.
+/// big slabs: no copying on growth, and a chunk never moves. A chunk can also
+/// be a stretch of memory someone else is done with, which saves faulting in
+/// fresh pages: on the scoring machines that costs about 75 ms per gigabyte.
 struct Buckets<T: Copy> {
     parts: Vec<Part<T>>,
     slabs: Vec<Vec<T>>,
+    /// Every chunk's first record, and the chunk before it in its partition.
+    bases: Vec<*mut T>,
     previous: Vec<u32>,
+    /// Records per chunk.
+    capacity: usize,
+    /// Chunks carved from our own slabs so far.
+    carved: usize,
+    /// Donated memory, each stretch big enough for one chunk.
+    spare: Vec<*mut T>,
 }
 
 unsafe impl<T: Copy + Send> Send for Buckets<T> {}
 unsafe impl<T: Copy + Send> Sync for Buckets<T> {}
 
 impl<T: Copy> Buckets<T> {
-    fn new(parts: usize) -> Self {
+    fn new(parts: usize, capacity: usize) -> Self {
         Self {
             parts: (0..parts)
                 .map(|_| Part {
@@ -82,7 +92,11 @@ impl<T: Copy> Buckets<T> {
                 })
                 .collect(),
             slabs: Vec::new(),
+            bases: Vec::new(),
             previous: Vec::new(),
+            capacity,
+            carved: 0,
+            spare: Vec::new(),
         }
     }
 
@@ -99,35 +113,46 @@ impl<T: Copy> Buckets<T> {
         }
     }
 
-    fn base(&self, chunk: u32) -> *mut T {
-        let chunk = chunk as usize;
-        unsafe { (self.slabs[chunk / SLAB].as_ptr() as *mut T).add((chunk % SLAB) * CHUNK) }
+    /// Hands over memory with room for one chunk, aligned for `T`.
+    fn donate(&mut self, memory: *mut u8) {
+        if memory as usize % std::mem::align_of::<T>() == 0 {
+            self.spare.push(memory as *mut T);
+        }
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, part: usize) {
-        let chunk = self.previous.len();
-        if chunk / SLAB == self.slabs.len() {
-            let slab = Vec::with_capacity(SLAB * CHUNK);
-            huge(slab.as_ptr(), SLAB * CHUNK);
-            self.slabs.push(slab);
-        }
-        let base = self.base(chunk as u32);
-        populate(base, CHUNK);
+        let base = match self.spare.pop() {
+            Some(base) => base,
+            None => {
+                if self.carved % SLAB == 0 {
+                    let slab = Vec::with_capacity(SLAB * self.capacity);
+                    huge(slab.as_ptr(), SLAB * self.capacity);
+                    self.slabs.push(slab);
+                }
+                let slab = self.slabs.last().unwrap().as_ptr() as *mut T;
+                let base = unsafe { slab.add((self.carved % SLAB) * self.capacity) };
+                self.carved += 1;
+                populate(base, self.capacity);
+                base
+            }
+        };
+        let chunk = self.bases.len() as u32;
+        self.bases.push(base);
         let slot = &mut self.parts[part];
         slot.chunks += 1;
         self.previous.push(slot.head);
-        slot.head = chunk as u32;
+        slot.head = chunk;
         slot.next = base;
-        slot.end = unsafe { base.add(CHUNK) };
+        slot.end = unsafe { base.add(self.capacity) };
     }
 
-    /// Gives the memory back now, from whichever thread calls: at exit the
-    /// kernel would free it page by page on one thread, inside the timed run.
+    /// Gives our own slabs back now, from whichever thread calls: at exit the
+    /// kernel would free them page by page on one thread, inside the timed run.
     fn release(&self) {
         for slab in &self.slabs {
-            release(slab.as_ptr(), SLAB * CHUNK);
+            release(slab.as_ptr(), SLAB * self.capacity);
         }
     }
 
@@ -138,14 +163,14 @@ impl<T: Copy> Buckets<T> {
         if chunk == NONE {
             return;
         }
-        let base = self.base(chunk);
+        let base = self.bases[chunk as usize];
         out.push((base, unsafe { slot.next.offset_from(base) } as usize));
         loop {
             chunk = self.previous[chunk as usize];
             if chunk == NONE {
                 break;
             }
-            out.push((self.base(chunk), CHUNK));
+            out.push((self.bases[chunk as usize], self.capacity));
         }
     }
 }
@@ -689,8 +714,8 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = Buckets::new(1 << shared.id_bits);
-    let mut clicks = Buckets::new(1 << shared.person_bits);
+    let mut events = Buckets::new(1 << shared.id_bits, CHUNK);
+    let mut clicks = Buckets::new(1 << shared.person_bits, CHUNK);
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
@@ -708,7 +733,10 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
 
 fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
-    let mut out = Buckets::new(1 << shared.person_bits);
+    // The events go into the memory of the parsed records they came from: a
+    // parsed chunk, once read, is room for one chunk of events.
+    let room = CHUNK * std::mem::size_of::<Parsed>() / std::mem::size_of::<Event>();
+    let mut out = Buckets::new(1 << shared.person_bits, room);
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut table: Vec<u32> = Vec::new();
@@ -769,6 +797,10 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
                     out.push(person_part(person, person_bits), Event { person, value });
                 }
+            }
+            // Every record of this bucket has been read: its chunks are free.
+            for &(base, _) in &chunks {
+                out.donate(base as *mut u8);
             }
         }
     }
@@ -1358,13 +1390,7 @@ fn main() -> io::Result<()> {
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
                 let (events, clicks, next) = (&events, &clicks, &next);
-                scope.spawn(move || {
-                    // The parsed events are done with: free them alongside.
-                    if let Some(done) = parsed_events.get(thread).filter(|_| give_back) {
-                        done.release();
-                    }
-                    session_worker(shared, events, clicks, order, next, thread)
-                })
+                scope.spawn(move || session_worker(shared, events, clicks, order, next, thread))
             })
             .collect();
         handles
@@ -1433,7 +1459,10 @@ fn main() -> io::Result<()> {
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
             let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let parsed_events = &parsed_events;
             scope.spawn(move || {
+                // The parsed slabs hold the events too by now.
+                parsed_events[thread].release();
                 events[thread].release();
                 clicks[thread].release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
