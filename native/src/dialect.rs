@@ -25,6 +25,18 @@ fn masks(bytes: &[u8; 16]) -> (u16, u16) {
         (mask(b',' as i8), mask(b'"' as i8))
     }
 }
+// The Xeon build targets x86-64-v3, which includes AVX2.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn masks_wide(bytes: &[u8; 32]) -> (u32, u32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let input = _mm256_loadu_si256(bytes.as_ptr().cast());
+        let mask = |b| _mm256_movemask_epi8(_mm256_cmpeq_epi8(input, _mm256_set1_epi8(b))) as u32;
+        (mask(b',' as i8), mask(b'"' as i8))
+    }
+}
+
 #[inline]
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     if !(16..=127).contains(&line.len()) {
@@ -33,14 +45,29 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut commas = 0u128;
     let mut quotes = 0u128;
     let mut offset = 0;
-    loop {
-        let (c, q) = masks(line[offset..offset + 16].try_into().unwrap());
-        commas |= u128::from(c) << offset;
-        quotes |= u128::from(q) << offset;
-        if offset + 16 == line.len() {
-            break;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if line.len() >= 32 {
+        loop {
+            let (c, q) = masks_wide(line[offset..offset + 32].try_into().unwrap());
+            commas |= u128::from(c) << offset;
+            quotes |= u128::from(q) << offset;
+            if offset + 32 == line.len() {
+                break;
+            }
+            offset = (offset + 32).min(line.len() - 32);
         }
-        offset = (offset + 16).min(line.len() - 16);
+    }
+    if commas == 0 && quotes == 0 {
+        offset = 0;
+        loop {
+            let (c, q) = masks(line[offset..offset + 16].try_into().unwrap());
+            commas |= u128::from(c) << offset;
+            quotes |= u128::from(q) << offset;
+            if offset + 16 == line.len() {
+                break;
+            }
+            offset = (offset + 16).min(line.len() - 16);
+        }
     }
     if commas.count_ones() != N as u32 - 1 {
         return None;

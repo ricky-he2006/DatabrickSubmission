@@ -1,9 +1,22 @@
-FROM rust:1.85-slim-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.85-slim-bookworm AS builder
+ARG BUILDARCH
+ARG TARGETARCH
 WORKDIR /src
-COPY native/Cargo.toml native/Cargo.lock ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --locked --release && rm -rf src
-COPY native/src ./src
-RUN touch src/main.rs && cargo build --release --locked
+RUN case "$TARGETARCH" in \
+      amd64) target=x86_64-unknown-linux-gnu; linker=x86_64-linux-gnu-gcc; cross=gcc-x86-64-linux-gnu ;; \
+      arm64) target=aarch64-unknown-linux-gnu; linker=aarch64-linux-gnu-gcc; cross=gcc-aarch64-linux-gnu ;; \
+      *) exit 1 ;; \
+    esac && \
+    if [ "$BUILDARCH" != "$TARGETARCH" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends "$cross" "libc6-dev-$TARGETARCH-cross"; \
+    fi && \
+    rustup target add "$target" && printf '%s\n%s\n' "$target" "$linker" > /target-info
+COPY native/ ./
+RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
+    if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
+    case "$TARGETARCH" in amd64) cpu=x86-64-v3 ;; arm64) cpu=generic ;; esac && \
+    RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu" cargo build --locked --release --target "$target" && \
+    cp "target/$target/release/shopping-sessions" /shopping-sessions
 FROM debian:bookworm-slim
-COPY --from=builder /src/target/release/shopping-sessions /app/native
+COPY --from=builder /shopping-sessions /app/native
 CMD ["/app/native"]
