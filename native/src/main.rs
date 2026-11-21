@@ -245,6 +245,67 @@ struct Totals {
     revenue: i64,
     assists: i64,
 }
+enum CampaignTotals {
+    Dense {
+        first_day: i64,
+        days: usize,
+        counts: Vec<Totals>,
+    },
+    Sparse(Map<(u32, i64), Totals>),
+}
+
+impl CampaignTotals {
+    fn new(first_day: i64, days: usize, campaigns: usize) -> Self {
+        if let Some(size) = days.checked_mul(campaigns).filter(|&n| n <= 65_536) {
+            Self::Dense {
+                first_day,
+                days,
+                counts: std::iter::repeat_with(Totals::default).take(size).collect(),
+            }
+        } else {
+            Self::Sparse(Map::default())
+        }
+    }
+
+    fn get(&mut self, campaign: u32, day: i64) -> &mut Totals {
+        match self {
+            Self::Dense {
+                first_day,
+                days,
+                counts,
+            } => &mut counts[campaign as usize * *days + (day - *first_day) as usize],
+            Self::Sparse(counts) => counts.entry((campaign, day)).or_default(),
+        }
+    }
+
+    fn merge_into(self, totals: &mut Map<(u32, i64), Totals>) {
+        let mut add = |key, value: Totals| {
+            let total = totals.entry(key).or_default();
+            total.sessions += value.sessions;
+            total.revenue += value.revenue;
+            total.purchases += value.purchases;
+            total.assists += value.assists;
+        };
+        match self {
+            Self::Dense {
+                first_day,
+                days,
+                counts,
+            } => {
+                for (index, count) in counts.into_iter().enumerate() {
+                    if count.sessions != 0 || count.assists != 0 {
+                        add(
+                            ((index / days) as u32, first_day + (index % days) as i64),
+                            count,
+                        );
+                    }
+                }
+            }
+            Self::Sparse(counts) => counts.into_iter().for_each(|(key, value)| add(key, value)),
+        }
+    }
+}
+
 fn write_user(
     out: &mut Report,
     person: &[u8],
@@ -668,7 +729,7 @@ fn main() -> io::Result<()> {
         })
         .collect();
     checkpoint("sort_and_collect");
-    let shards: io::Result<Vec<Map<(u32, i64), Totals>>> = groups
+    let shards: io::Result<Vec<CampaignTotals>> = groups
         .into_par_iter()
         .enumerate()
         .filter(|(part, (events, _))| *part == 0 || !events.is_empty())
@@ -686,7 +747,9 @@ fn main() -> io::Result<()> {
                     ("top_category", "optional"),
                 ],
             )?;
-            let mut totals: Map<(u32, i64), Totals> = Map::default();
+            let first_day = start.div_euclid(DAY);
+            let days = (end.saturating_sub(1).div_euclid(DAY) - first_day + 1).max(1) as usize;
+            let mut totals = CampaignTotals::new(first_day, days, campaign_names.len());
             let mut event_pos = 0;
             let mut click_pos = 0;
             let mut active = vec![0_u32; campaign_names.len()];
@@ -788,12 +851,12 @@ fn main() -> io::Result<()> {
                     } else {
                         0
                     };
-                    let total = totals.entry((credited, day)).or_default();
+                    let total = totals.get(credited, day);
                     total.sessions += 1;
                     total.revenue += revenue;
                     total.purchases += i64::from(revenue > 0);
                     for &c in &active_campaigns {
-                        totals.entry((c, day)).or_default().assists += 1;
+                        totals.get(c, day).assists += 1;
                     }
                 }
                 let category = category_revenue
@@ -819,13 +882,7 @@ fn main() -> io::Result<()> {
         .collect();
     let mut totals: Map<(u32, i64), Totals> = Map::default();
     for shard in shards? {
-        for (key, v) in shard {
-            let t = totals.entry(key).or_default();
-            t.sessions += v.sessions;
-            t.revenue += v.revenue;
-            t.purchases += v.purchases;
-            t.assists += v.assists;
-        }
+        shard.merge_into(&mut totals);
     }
     checkpoint("session_attribution_and_user_parquet");
     let mut output = Report::new(
