@@ -554,24 +554,47 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
-    let mut pairs: Vec<(u64, u64)> = Vec::new();
-    for path in &shared.link_files {
-        let source = Source::open(path, true)?;
-        let size = source.size;
+fn read_links(shared: &Shared, threads: usize) -> io::Result<Links> {
+    let sources = shared.link_files.iter()
+        .map(|path| Source::open(path, true))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut jobs = Vec::new();
+    for source in &sources {
         let mut start = 0;
-        while start < size {
-            let end = (start + LINK_BLOCK).min(size);
-            block.load(&source, start, end)?;
-            block.lines::<2>(|buf, fields| unsafe {
-                let a = keys::pack(buf.add(fields[0].0 as usize), (fields[0].1 - fields[0].0) as usize);
-                let b = keys::pack(buf.add(fields[1].0 as usize), (fields[1].1 - fields[1].0) as usize);
-                if a != 0 && b != 0 && a != b {
-                    pairs.push((a, b));
-                }
-            });
+        while start < source.size {
+            let end = (start + LINK_BLOCK).min(source.size);
+            jobs.push((source, start, end));
             start = end;
         }
+    }
+    let count = threads.min(jobs.len());
+    if count == 0 {
+        return Ok(Links::build(&[]));
+    }
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs.chunks(jobs.len().div_ceil(count)).map(|jobs| {
+            scope.spawn(move || -> io::Result<Vec<(u64, u64)>> {
+                let bytes: u64 = jobs.iter().map(|&(_, start, end)| end - start).sum();
+                let mut pairs = Vec::with_capacity(bytes as usize / 65);
+                let mut block = Block::new();
+                for &(source, start, end) in jobs {
+                    block.load(source, start, end)?;
+                    block.lines::<2>(|buf, fields| unsafe {
+                        let a = keys::pack(buf.add(fields[0].0 as usize), (fields[0].1 - fields[0].0) as usize);
+                        let b = keys::pack(buf.add(fields[1].0 as usize), (fields[1].1 - fields[1].0) as usize);
+                        if a != 0 && b != 0 && a != b {
+                            pairs.push((a, b));
+                        }
+                    });
+                }
+                Ok(pairs)
+            })
+        }).collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect::<io::Result<Vec<_>>>()
+    })?;
+    let mut pairs = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        pairs.extend(part);
     }
     Ok(Links::build(&pairs))
 }
@@ -602,9 +625,6 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         if ingest == ts::BAD {
             return;
         }
-        let (p, n) = field(1);
-        let user = keys::pack(p, n);
-        let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -613,12 +633,21 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
-        let mut valid = user != 0
-            && (purchase || other)
-            && fields[5].1 > fields[5].0
-            && at >= window_start
-            && at < window_end
-            && ingest - at <= DAY;
+        let packed_ingest = (ingest - ingest_base).clamp(0, u32::MAX as i64) as u32;
+        let bucket = (id.wrapping_mul(MIX) >> id_shift) as usize;
+        if !(purchase || other)
+            || fields[5].1 == fields[5].0
+            || at < window_start
+            || at >= window_end
+            || ingest - at > DAY
+        {
+            out.push(bucket, Parsed { id, user: 0, ingest: packed_ingest, ts: DEAD, payload: 0 });
+            return;
+        }
+        let (p, n) = field(1);
+        let user = keys::pack(p, n);
+        let user = if user == 0 { 0 } else { user ^ copy };
+        let mut valid = user != 0;
         let mut payload = 0;
         if purchase && valid {
             let (p, n) = field(6);
@@ -635,11 +664,11 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest: (ingest - ingest_base).clamp(0, u32::MAX as i64) as u32,
+            ingest: packed_ingest,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
+        out.push(bucket, record);
     });
 }
 
@@ -653,7 +682,6 @@ fn parse_clicks(
 ) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
-    pending.clear();
     block.lines::<4>(|buf, fields| unsafe {
         let field = |at: usize| (buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize);
         let (p, n) = field(0);
@@ -702,18 +730,8 @@ fn parse_clicks(
     }
 }
 
-fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Buckets<Click>)> {
+fn parse_worker(shared: &Shared) -> io::Result<(Buckets<Parsed>, Buckets<Click>)> {
     let mut block = Block::new();
-    if first {
-        // The other threads wait on this table, so a failure must not leave them waiting.
-        let began = Instant::now();
-        let links = read_links(shared, &mut block).unwrap_or_else(|error| {
-            eprintln!("links: {error}");
-            std::process::exit(1);
-        });
-        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
-        let _ = shared.links.set(links);
-    }
     let mut events = Buckets::new(1 << shared.id_bits, CHUNK);
     let mut clicks = Buckets::new(1 << shared.person_bits, CHUNK);
     let mut pending = Vec::new();
@@ -721,8 +739,16 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
+            let chunks = ((work.end - work.start) as usize / 65).div_ceil(CHUNK);
+            events.bases.reserve(chunks);
+            events.previous.reserve(chunks);
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
+            let chunks = ((work.end - work.start) as usize / 65).div_ceil(CHUNK);
+            clicks.bases.reserve(chunks);
+            clicks.previous.reserve(chunks);
+            pending.clear();
+            pending.reserve((work.end - work.start) as usize / 65);
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
@@ -1353,9 +1379,14 @@ fn main() -> io::Result<()> {
     let shared = &shared;
     let setup = began.elapsed();
 
+    let link_start = Instant::now();
+    let links = read_links(shared, threads)?;
+    LINKS_MICROS.store(link_start.elapsed().as_micros() as usize, Ordering::Relaxed);
+    let _ = shared.links.set(links);
+
     let parsed: Vec<(Buckets<Parsed>, Buckets<Click>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread == 0)))
+            .map(|_| scope.spawn(|| parse_worker(shared)))
             .collect();
         handles
             .into_iter()
