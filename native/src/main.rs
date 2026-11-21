@@ -18,7 +18,7 @@ mod ts;
 
 use scan::{Block, Source};
 use std::cmp::Ordering as Order;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -217,14 +217,13 @@ impl Dim {
     }
 
     fn insert(&mut self, name: &[u8], value: u32) {
-        let mut padded = name.to_vec();
-        padded.extend_from_slice(&[0; 16]);
-        let number = unsafe { ts::numbered(padded.as_ptr(), name.len(), self.prefix) };
+        // `numbered` reads only the name's own bytes.
+        let number = unsafe { ts::numbered(name.as_ptr(), name.len(), self.prefix) };
         if number == usize::MAX {
             self.other.insert(name.to_vec(), value);
         } else {
             if self.dense.len() <= number {
-                self.dense.resize(number + 1, 0);
+                self.dense.resize((number + 1).max(self.dense.len() * 2), 0);
             }
             self.dense[number] = value;
         }
@@ -779,12 +778,12 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
 // ---------------------------------------------------------------- phase 3
 
 const USER_COLUMNS: [(&str, pq::Kind); 6] = [
-    ("user_id", pq::Kind::Text),
+    ("user_id", pq::Kind::Keyed),
     ("day", pq::Kind::Date),
     ("sessions", pq::Kind::Int32),
     ("events", pq::Kind::Int32),
     ("revenue_cents", pq::Kind::Int64),
-    ("top_category", pq::Kind::OptionalText),
+    ("top_category", pq::Kind::Category),
 ];
 
 /// Per campaign and day: credited sessions, of those purchasing, revenue, assists.
@@ -811,19 +810,19 @@ impl Sessions<'_> {
                 .output
                 .join("user_daily")
                 .join(format!("part-{:03}.parquet", self.thread));
-            self.writer = Some(pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS)?);
+            self.writer = Some(pq::Writer::create(
+                &path,
+                &USER_COLUMNS,
+                GROUP_ROWS,
+                &shared.categories,
+            )?);
         }
         let writer = self.writer.as_mut().unwrap();
-        let name = writer.raw(0);
-        let at = name.len();
-        name.extend_from_slice(&[0; 4]);
-        keys::unpack(person, name);
-        let length = (name.len() - at - 4) as u32;
-        name[at..at + 4].copy_from_slice(&length.to_le_bytes());
-        writer.int32(1, (shared.first_day + day as i64) as i32);
-        writer.int32(2, sessions as i32);
-        writer.int32(3, events as i32);
-        writer.int64(4, revenue as i64);
+        writer.keyed(0, person, |name| keys::unpack(person, name));
+        writer.int(1, shared.first_day + day as i64);
+        writer.int(2, sessions as i64);
+        writer.int(3, events as i64);
+        writer.int(4, revenue as i64);
         let mut top: Option<usize> = None;
         for &category in &self.touched {
             let category = category as usize;
@@ -837,8 +836,9 @@ impl Sessions<'_> {
             self.sums[category as usize] = 0;
         }
         self.touched.clear();
-        writer.optional_text(5, top.map(|category| shared.categories[category].as_slice()));
-        writer.end_row()
+        writer.category(5, top.map(|category| category as u8));
+        writer.end_row();
+        Ok(())
     }
 
     /// One person: their events sorted by time, their clicks by time then ID.
@@ -1214,23 +1214,47 @@ fn main() -> io::Result<()> {
     );
 
     // Categories are numbered in byte order, so the smaller number wins a tie.
-    let product_rows = read_pairs(&data.join("products.csv"))?;
-    let mut names: BTreeSet<&[u8]> = product_rows.iter().map(|row| row.1.as_slice()).collect();
-    names.insert(b"unknown");
-    let categories: Vec<Vec<u8>> = names.iter().map(|name| name.to_vec()).collect();
-    assert!(categories.len() <= 256, "more than 256 categories");
+    // Products, without an allocation per row: categories are numbered as they
+    // appear, then renumbered in byte order so the smaller number wins a tie.
+    let mut seen: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
     let mut products = Dim::new(b"p");
-    for (product, category) in &product_rows {
-        if !product.is_empty() {
-            let index = categories
-                .binary_search_by(|name| name.as_slice().cmp(category))
-                .unwrap();
-            products.insert(product, index as u32 + 1);
+    {
+        let source = Source::open(&data.join("products.csv"), false)?;
+        if source.size > 0 {
+            let mut block = Block::new();
+            block.load(&source, 0, source.size)?;
+            block.lines::<2>(|buf, fields| unsafe {
+                let text = |at: usize| {
+                    std::slice::from_raw_parts(buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize)
+                };
+                let (product, category) = (text(0), text(1));
+                if product.is_empty() {
+                    return;
+                }
+                let index = match seen.iter().position(|name| name.as_slice() == category) {
+                    Some(index) => index,
+                    None => {
+                        seen.push(category.to_vec());
+                        seen.len() - 1
+                    }
+                };
+                products.insert(product, index as u32 + 1);
+            });
         }
     }
-    let unknown = categories
-        .binary_search_by(|name| name.as_slice().cmp(b"unknown"))
-        .unwrap() as u32;
+    assert!(seen.len() <= 256, "more than 256 categories");
+    let mut categories = seen.clone();
+    categories.sort();
+    let renumber: Vec<u32> = seen
+        .iter()
+        .map(|name| categories.binary_search(name).unwrap() as u32 + 1)
+        .collect();
+    for value in products.dense.iter_mut().chain(products.other.values_mut()) {
+        if *value != 0 {
+            *value = renumber[*value as usize - 1];
+        }
+    }
+    let unknown = renumber[0] - 1;
 
     let mut campaigns = Dim::new(b"c_");
     let mut campaign_names = vec![b"organic".to_vec()];
@@ -1352,7 +1376,7 @@ fn main() -> io::Result<()> {
 
     if !results.iter().any(|result| result.1) {
         let path = shared.output.join("user_daily").join("part-000.parquet");
-        pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS)?.finish()?;
+        pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS, &shared.categories)?.finish()?;
     }
     let mut writer = pq::Writer::create(
         &shared.output.join("campaign_daily").join("part-000.parquet"),
@@ -1366,6 +1390,7 @@ fn main() -> io::Result<()> {
             ("assisted_sessions", pq::Kind::Int64),
         ],
         GROUP_ROWS,
+        &[],
     )?;
     for campaign in 0..shared.campaign_names.len() {
         for day in 0..shared.days {
@@ -1381,12 +1406,12 @@ fn main() -> io::Result<()> {
             }
             writer.text(0, &shared.campaign_names[campaign]);
             writer.text(1, &shared.campaign_channels[campaign]);
-            writer.int32(2, (shared.first_day + day as i64) as i32);
-            writer.int64(3, sum[0]);
-            writer.int64(4, sum[1]);
-            writer.int64(5, sum[2]);
-            writer.int64(6, sum[3]);
-            writer.end_row()?;
+            writer.int(2, shared.first_day + day as i64);
+            writer.int(3, sum[0]);
+            writer.int(4, sum[1]);
+            writer.int(5, sum[2]);
+            writer.int(6, sum[3]);
+            writer.end_row();
         }
     }
     writer.finish()?;
