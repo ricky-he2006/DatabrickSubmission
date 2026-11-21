@@ -36,7 +36,7 @@ const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 11;
-const PERSON_BITS: u32 = 11;
+const PERSON_BITS: u32 = 10;
 const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// The `ts` of an event that is invalid, late, or a losing duplicate.
 const DEAD: u32 = u32::MAX;
@@ -1187,14 +1187,19 @@ fn session_worker(
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
             let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
-            } else {
-                mine.sort_unstable();
+            if !mine.is_sorted_by_key(|value| value >> 32) {
+                if mine.len() > 2048 {
+                    sort_by_time(mine, &mut scratch);
+                } else {
+                    mine.sort_unstable();
+                }
             }
             let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
+            let order = |a: &Touch, b: &Touch| {
+                a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id))
+            };
+            if !reached.is_sorted_by(|a, b| order(a, b).is_le()) {
+                reached.sort_unstable_by(order);
             }
             sessions.person(person, mine, reached)?;
             from = to;
