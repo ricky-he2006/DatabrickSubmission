@@ -561,9 +561,11 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
         while start < size {
             let end = (start + LINK_BLOCK).min(size);
             block.load(&source, start, end)?;
-            block.lines::<2>(|buf, fields| unsafe {
-                let a = keys::pack(buf.add(fields[0].0 as usize), (fields[0].1 - fields[0].0) as usize);
-                let b = keys::pack(buf.add(fields[1].0 as usize), (fields[1].1 - fields[1].0) as usize);
+            block.raw_lines::<2>(|buf, start, seps| unsafe {
+                let (p, n) = scan::field(buf, start, seps, 0);
+                let a = keys::pack(p, n);
+                let (p, n) = scan::field(buf, start, seps, 1);
+                let b = keys::pack(p, n);
                 if a != 0 && b != 0 && a != b {
                     pairs.push((a, b));
                 }
@@ -587,8 +589,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     let ingest_base = window_start - 10 * DAY;
-    block.lines::<7>(|buf, fields| unsafe {
-        let field = |at: usize| (buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize);
+    block.raw_lines::<7>(|buf, start, seps| unsafe {
+        let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = keys::pack(p, n);
         if id == 0 {
@@ -613,7 +615,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         };
         let mut valid = user != 0
             && (purchase || other)
-            && fields[5].1 > fields[5].0
+            && field(5).1 > 0
             && at >= window_start
             && at < window_end
             && ingest - at <= DAY;
@@ -652,8 +654,8 @@ fn parse_clicks(
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
     pending.clear();
-    block.lines::<4>(|buf, fields| unsafe {
-        let field = |at: usize| (buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize);
+    block.raw_lines::<4>(|buf, start, seps| unsafe {
+        let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
         let id = keys::pack(p, n);
         let (p, n) = field(1);
