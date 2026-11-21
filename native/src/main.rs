@@ -1227,10 +1227,17 @@ fn main() -> io::Result<()> {
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
     let map = tune("SS_MAP", 1) != 0;
-    let give_back = tune("SS_RELEASE", 1) != 0;
+    let give_back = tune("SS_RELEASE", 0) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
-    let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
+    let args: Vec<String> = std::env::args().collect();
+    let (data, output) = if args.len() >= 3 {
+        (PathBuf::from(&args[args.len() - 2]), PathBuf::from(&args[args.len() - 1]))
+    } else {
+        (
+            PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into())),
+            PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into())),
+        )
+    };
     let threads = std::env::var("NCPU")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1488,5 +1495,13 @@ fn main() -> io::Result<()> {
         total.as_secs_f64()
     );
     // Everything left is memory the kernel frees faster than we can.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        _exit(0);
+    }
+    #[cfg(not(target_os = "linux"))]
     std::process::exit(0);
 }

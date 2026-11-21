@@ -49,8 +49,10 @@ impl Source {
                 mapped = address as *const u8;
                 #[cfg(target_os = "linux")]
                 unsafe {
-                    madvise(address, size as usize, 14); // MADV_HUGEPAGE
-                    madvise(address, size as usize, 3);  // MADV_WILLNEED
+                    const MADV_WILLNEED: i32 = 3;
+                    const MADV_HUGEPAGE: i32 = 14;
+                    madvise(address, size as usize, MADV_HUGEPAGE);
+                    madvise(address, size as usize, MADV_WILLNEED);
                 }
             }
         }
