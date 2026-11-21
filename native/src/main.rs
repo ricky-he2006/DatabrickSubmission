@@ -1,5 +1,6 @@
 mod dialect;
 mod fast;
+mod radix;
 mod report;
 
 use dialect::fields;
@@ -10,12 +11,10 @@ use rustc_hash::FxHashMap;
 use std::{
     env,
     fs::{self, File},
-    hash::Hasher,
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     time::Instant,
 };
-use voracious_radix_sort::RadixSort;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -23,17 +22,13 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const WEEK: i64 = 604_800_000;
 const DAY: i64 = 86_400_000;
 const SESSION_GAP: i64 = 1_800_000;
-const BIAS: u64 = 1u64 << 63; // sign flip for i64 -> ordered u64
 
-// Keys: 7-bit injection for <=9-byte printable-ASCII IDs; mutex side table otherwise.
 struct Keys {
     unusual: std::sync::Mutex<(FxHashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>,
 }
 
 impl Keys {
-    fn new() -> Self {
-        Self { unusual: std::sync::Mutex::new((FxHashMap::default(), Vec::new())) }
-    }
+    fn new() -> Self { Self { unusual: std::sync::Mutex::new((FxHashMap::default(), Vec::new())) } }
 
     #[inline]
     fn key(&self, v: &[u8]) -> u64 {
@@ -54,10 +49,7 @@ impl Keys {
         if k >> 63 == 0 {
             let mut out = Vec::with_capacity(9);
             let mut v = k;
-            while v != 0 {
-                out.push((v & 0x7f) as u8);
-                v >>= 7;
-            }
+            while v != 0 { out.push((v & 0x7f) as u8); v >>= 7; }
             out.reverse();
             out
         } else {
@@ -273,16 +265,16 @@ fn load_events(
     let mut raw: Vec<RawEvent> = chunks.into_iter().flatten().collect();
     raw.retain(|e| e.event_id != 0 && e.ingest_ts != i64::MIN);
 
-    // Dedup: sort by event_id, keep smallest ingest_ts per group.
-    raw.par_radix_sort_unstable_by(|e| e.event_id as u128);
-    let mut dedup: Vec<RawEvent> = Vec::with_capacity(raw.len());
+    // 并行 dedup：按 event_id 排序后分组，每组取最小 ingest_ts
+    let sorted = radix::par_radix_sort_by_key(raw, |e| e.event_id);
+    let mut dedup: Vec<RawEvent> = Vec::with_capacity(sorted.len());
     let mut i = 0;
-    while i < raw.len() {
-        let id = raw[i].event_id;
+    while i < sorted.len() {
+        let id = sorted[i].event_id;
         let mut j = i + 1;
-        while j < raw.len() && raw[j].event_id == id { j += 1; }
-        let mut best = raw[i];
-        for k in i+1..j { if raw[k].ingest_ts < best.ingest_ts { best = raw[k]; } }
+        while j < sorted.len() && sorted[j].event_id == id { j += 1; }
+        let mut best = sorted[i];
+        for k in i + 1..j { if sorted[k].ingest_ts < best.ingest_ts { best = sorted[k]; } }
         dedup.push(best);
         i = j;
     }
@@ -299,11 +291,20 @@ fn load_events(
         Some(Event { person, ts: e.ts, category, price: e.price, is_purchase: e.event_type == 2 })
     }).collect();
 
-    let mut events = events;
-    events.par_radix_sort_unstable_by(|e| {
-        ((e.person as u128) << 64) | (((e.ts as u64) ^ BIAS) as u128)
-    });
-    Ok(events)
+    // 并行按 (person, ts) 排序
+    let keyed: Vec<(u128, Event)> = events.into_iter().map(|e| (((e.person as u128) << 64) | (e.ts as u64 as u128), e)).collect();
+    let sorted = radix::par_radix_sort_by_key(keyed, |x| (x.0 >> 64) as u64); // 先按 person
+    let mut result: Vec<Event> = sorted.into_iter().map(|(_, e)| e).collect();
+    // 同一 person 内部按 ts 排序
+    let mut i = 0;
+    while i < result.len() {
+        let p = result[i].person;
+        let mut j = i + 1;
+        while j < result.len() && result[j].person == p { j += 1; }
+        result[i..j].sort_unstable_by_key(|e| e.ts);
+        i = j;
+    }
+    Ok(result)
 }
 
 fn load_clicks(
@@ -333,14 +334,14 @@ fn load_clicks(
     let mut raw: Vec<RawClick> = chunks.into_iter().flatten().collect();
     raw.retain(|c| c.id != 0);
 
-    raw.par_radix_sort_unstable_by(|c| c.id as u128);
-    let mut dedup: Vec<RawClick> = Vec::with_capacity(raw.len());
+    let sorted = radix::par_radix_sort_by_key(raw, |c| c.id);
+    let mut dedup: Vec<RawClick> = Vec::with_capacity(sorted.len());
     let mut i = 0;
-    while i < raw.len() {
-        let id = raw[i].id;
+    while i < sorted.len() {
+        let id = sorted[i].id;
         let mut j = i + 1;
-        while j < raw.len() && raw[j].id == id { j += 1; }
-        dedup.push(raw[i]);
+        while j < sorted.len() && sorted[j].id == id { j += 1; }
+        dedup.push(sorted[i]);
         i = j;
     }
 
@@ -352,29 +353,26 @@ fn load_clicks(
         Some(Click { person, ts: c.ts, campaign, id: c.id })
     }).collect();
 
-    let mut clicks = clicks;
-    clicks.par_radix_sort_unstable_by(|c| {
-        ((c.person as u128) << 64) | (((c.ts as u64) ^ BIAS) as u128)
-    });
-    // Tie-break click_id within (person, ts) groups.
+    // 并行按 person 排序，组内按 (ts, id) 排序
+    let keyed: Vec<(u64, Click)> = clicks.into_iter().map(|c| (c.person, c)).collect();
+    let sorted = radix::par_radix_sort_by_key(keyed, |x| x.0);
+    let mut result: Vec<Click> = sorted.into_iter().map(|(_, c)| c).collect();
     let mut i = 0;
-    while i < clicks.len() {
-        let (p, t) = (clicks[i].person, clicks[i].ts);
+    while i < result.len() {
+        let p = result[i].person;
         let mut j = i + 1;
-        while j < clicks.len() && clicks[j].person == p && clicks[j].ts == t { j += 1; }
-        if j - i > 1 { clicks[i..j].sort_unstable_by_key(|c| c.id); }
+        while j < result.len() && result[j].person == p { j += 1; }
+        result[i..j].sort_unstable_by_key(|c| (c.ts, c.id));
         i = j;
     }
-    Ok(clicks)
+    Ok(result)
 }
 
-fn top_category(sums: &[(u32, i64)], names: &[Vec<u8>]) -> Option<u32> {
+fn top_category(sums: &[(u32, i64)]) -> Option<u32> {
     if sums.is_empty() { return None; }
     let mut best = sums[0];
     for &(c, s) in &sums[1..] {
-        if s > best.1 || (s == best.1 && names[c as usize] < names[best.0 as usize]) {
-            best = (c, s);
-        }
+        if s > best.1 { best = (c, s); }
     }
     Some(best.0)
 }
@@ -382,8 +380,7 @@ fn top_category(sums: &[(u32, i64)], names: &[Vec<u8>]) -> Option<u32> {
 fn process_chunk(
     events: &[Event],
     clicks: &[Click],
-    w_start: i64,
-    campaign_count: u32,
+    _w_start: i64,
 ) -> (Vec<UserRow>, Vec<((u32, i64), Totals)>) {
     if events.is_empty() { return (Vec::new(), Vec::new()); }
     let mut user_rows: Vec<UserRow> = Vec::new();
@@ -438,7 +435,6 @@ fn process_chunk(
                 person_clicks[k].campaign
             } else { 0 };
 
-            // Assists: unique non-organic campaigns in [lo, hi).
             let mut assists: Vec<u32> = Vec::with_capacity(8);
             for c in &person_clicks[lo..hi] {
                 if c.campaign != 0 && !assists.contains(&c.campaign) { assists.push(c.campaign); }
@@ -448,7 +444,7 @@ fn process_chunk(
                 if let Some(d) = cur_day {
                     user_rows.push(UserRow {
                         person, day: d, sessions: day_sessions, events: day_events, revenue: day_revenue,
-                        top_category: top_category(&cat_buf, &[]),
+                        top_category: top_category(&cat_buf),
                     });
                     cat_buf.clear();
                 }
@@ -469,11 +465,9 @@ fn process_chunk(
         if let Some(d) = cur_day {
             user_rows.push(UserRow {
                 person, day: d, sessions: day_sessions, events: day_events, revenue: day_revenue,
-                top_category: top_category(&cat_buf, &[]),
+                top_category: top_category(&cat_buf),
             });
         }
-        // ignore unused hint
-        let _ = campaign_count;
     }
     let campaign_vec: Vec<((u32, i64), Totals)> = campaigns.into_iter().collect();
     (user_rows, campaign_vec)
@@ -512,7 +506,7 @@ fn main() -> io::Result<()> {
     eprintln!("clicks_count={}", clicks.len());
     cp("clicks");
 
-    // Chunk events at person boundaries for parallel sessionize.
+    // 按 person 分片并行 sessionize。每个分片边界对齐到 person。
     let n_chunks = 32;
     let chunk_size = (events.len() + n_chunks - 1) / n_chunks;
     let mut bounds = vec![0usize];
@@ -524,10 +518,9 @@ fn main() -> io::Result<()> {
     }
     bounds.push(events.len());
 
-    let campaign_count = campaign_names.len() as u32;
     let results: Vec<(Vec<UserRow>, Vec<((u32, i64), Totals)>)> =
         (0..bounds.len() - 1).into_par_iter().map(|i| {
-            process_chunk(&events[bounds[i]..bounds[i + 1]], &clicks, w_start, campaign_count)
+            process_chunk(&events[bounds[i]..bounds[i + 1]], &clicks, w_start)
         }).collect();
     cp("sessions");
 
@@ -544,7 +537,6 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // Fill user names and top_category bytes.
     let mut report = Report::new(out, "user_daily", &[
         ("user_id", "text"),
         ("day", "day"),
@@ -566,7 +558,6 @@ fn main() -> io::Result<()> {
     }
     report.finish()?;
 
-    // Write campaign_daily.
     let mut report = Report::new(out, "campaign_daily", &[
         ("campaign_id", "text"),
         ("channel", "text"),
