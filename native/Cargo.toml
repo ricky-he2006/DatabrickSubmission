@@ -3,6 +3,9 @@ name = "shopping-sessions"
 version = "1.0.0"
 edition = "2024"
 
+[features]
+fused = []
+
 [dependencies]
 
 [profile.release]

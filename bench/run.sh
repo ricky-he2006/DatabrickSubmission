@@ -10,6 +10,8 @@ git worktree add -q /tmp/base origin/a 2>/dev/null || true
 (cd "$ROOT/native" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8; cargo build --release 2>&1 | tail -1)
 BASE=/tmp/base/native/target/release/shopping-sessions
 NEW=$ROOT/native/target/release/shopping-sessions
+(cd "$ROOT/native" && cargo build --release --features fused --target-dir /tmp/alt 2>&1 | tail -1)
+ALT=/tmp/alt/release/shopping-sessions
 RUNS=${RUNS:-5}
 declare -A best line
 names=()
@@ -22,7 +24,7 @@ for round in $(seq "$RUNS"); do
   for i in "${!names[@]}"; do
     name=${names[$i]}; eval "which=\$W_$i"; eval "envs=\$E_$i"
     case "$name" in 1:*) [ "$round" -gt 2 ] && continue;; esac
-    bin=$NEW; [ "$which" = base ] && bin=$BASE
+    bin=$NEW; [ "$which" = base ] && bin=$BASE; [ "$which" = alt ] && bin=$ALT
     rm -rf /dev/shm/out/*
     start=$(date +%s%N)
     out=$(env DATA_DIR=/dev/shm/d20 OUTPUT_DIR=/dev/shm/out NCPU=4 $envs "$bin" 2>&1)

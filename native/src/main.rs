@@ -13,6 +13,10 @@
 mod diag;
 mod keys;
 mod pq;
+#[cfg(not(feature = "fused"))]
+mod scan;
+#[cfg(feature = "fused")]
+#[path = "scan_fused.rs"]
 mod scan;
 mod ts;
 
