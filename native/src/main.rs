@@ -417,6 +417,8 @@ static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
 /// 3 also decodes every field but keeps nothing.
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static SINK: AtomicUsize = AtomicUsize::new(0);
+/// Decode ablations, a bit mask (see parse_events).
+static ABL: AtomicUsize = AtomicUsize::new(0);
 
 /// (user ms, system ms, minor faults, involuntary switches) so far.
 fn usage() -> [i64; 4] {
@@ -610,38 +612,67 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let ingest_base = window_start - 10 * DAY;
     let decode_only = MODE.load(Ordering::Relaxed) == 3;
     let mut kept = 0usize;
+    let abl = ABL.load(Ordering::Relaxed);
+    let cheap = |p: *const u8, n: usize| (p as u64 >> 3) ^ n as u64 | 1;
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
+        if abl & 32 != 0 {
+            let mut sum = 0usize;
+            for at in 0..7 {
+                let (p, n) = field(at);
+                sum = sum.wrapping_add(p as usize ^ n);
+            }
+            kept = kept.wrapping_add(sum);
+            return;
+        }
         let (p, n) = field(0);
-        let id = keys::pack(p, n);
+        let id = if abl & 4 != 0 { cheap(p, n) } else { keys::pack(p, n) };
         if id == 0 {
             return;
         }
         let id = id ^ copy;
         let (p, n) = field(3);
-        let ingest = ts::parse(p, n, dates);
+        let ingest = if abl & 2 != 0 { window_start + n as i64 } else { ts::parse(p, n, dates) };
         if ingest == ts::BAD {
             return;
         }
         let (p, n) = field(1);
-        let user = keys::pack(p, n);
+        let user = if abl & 4 != 0 { cheap(p, n) } else { keys::pack(p, n) };
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
+        let at = if abl & 1 != 0 { window_start + n as i64 } else { ts::parse(p, n, dates) };
         let (p, n) = field(4);
-        let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
-        let other = n == 4 && {
+        let (purchase, mut valid) = if abl & 8 != 0 {
+            (n == 8, true)
+        } else if abl & 64 != 0 {
             let word = u32::from_le((p as *const u32).read_unaligned());
-            word == VIEW || word == CART
+            let purchase = (n == 8) & ((p as *const u64).read_unaligned() == PURCHASE.to_le());
+            let other = (n == 4) & ((word == VIEW) | (word == CART));
+            let valid = (user != 0)
+                & (purchase | other)
+                & (field(5).1 > 0)
+                & (at >= window_start)
+                & (at < window_end)
+                & (ingest - at <= DAY);
+            (purchase, valid)
+        } else {
+            let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
+            let other = n == 4 && {
+                let word = u32::from_le((p as *const u32).read_unaligned());
+                word == VIEW || word == CART
+            };
+            let valid = user != 0
+                && (purchase || other)
+                && field(5).1 > 0
+                && at >= window_start
+                && at < window_end
+                && ingest - at <= DAY;
+            (purchase, valid)
         };
-        let mut valid = user != 0
-            && (purchase || other)
-            && field(5).1 > 0
-            && at >= window_start
-            && at < window_end
-            && ingest - at <= DAY;
         let mut payload = 0;
-        if purchase && valid {
+        if abl & 16 != 0 {
+            payload = field(6).1 as u32;
+        } else if purchase && valid {
             let (p, n) = field(6);
             let price = ts::price(p, n);
             if price == 0 {
@@ -1307,6 +1338,7 @@ fn main() -> io::Result<()> {
     let give_back = tune("SS_RELEASE", 1) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
     MODE.store(tune("SS_MODE", 0) as usize, Ordering::Relaxed);
+    ABL.store(tune("SS_ABL", 0) as usize, Ordering::Relaxed);
     let mut marks = vec![usage()];
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
