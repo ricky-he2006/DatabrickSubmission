@@ -1,12 +1,13 @@
-// Comma-split with memchr; strict quote validation per rules.md.
 #[inline]
 fn validate(f: &[u8]) -> Option<&[u8]> {
     if f.is_empty() { return Some(f); }
-    if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+    let quoted = f[0] == b'"';
+    if quoted {
+        if f.len() < 2 || f[f.len() - 1] != b'"' { return None; }
         let inner = &f[1..f.len() - 1];
-        if inner.iter().any(|&b| b == b'"') { return None; }
+        if memchr::memchr(b'"', inner).is_some() { return None; }
         Some(inner)
-    } else if f.iter().any(|&b| b == b'"') {
+    } else if memchr::memchr(b'"', f).is_some() {
         None
     } else {
         Some(f)
