@@ -1224,9 +1224,8 @@ fn main() -> io::Result<()> {
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
-    let block = tune("SS_BLOCK", BLOCK).max(4096);
+    let block_override = std::env::var("SS_BLOCK").ok().and_then(|value| value.parse::<u64>().ok());
     let map = tune("SS_MAP", 1) != 0;
-    let give_back = tune("SS_RELEASE", 0) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
     let args: Vec<String> = std::env::args().collect();
     let (data, output) = if args.len() >= 3 {
@@ -1307,34 +1306,32 @@ fn main() -> io::Result<()> {
     }
 
     let mut files = Vec::new();
-    let mut work = Vec::new();
     for (folder, events) in [("events", true), ("clicks", false)] {
         for path in csv_files(&data.join(folder))? {
-            let source = Source::open(&path, map)?;
-            let size = source.size;
-            // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
-            for copy in 0..copies {
-                let mut start = 0;
-                while start < size {
-                    let end = (start + block).min(size);
-                    work.push(Work {
-                        events,
-                        copy: copy << 56,
-                        file: files.len(),
-                        start,
-                        end,
-                    });
-                    start = end;
-                }
-            }
-            files.push(source);
+            files.push((Source::open(&path, map)?, events));
         }
     }
-
+    let input_bytes: u64 = files.iter().map(|(source, _)| source.size).sum();
+    let large_input = input_bytes >= 1 << 30;
+    // Larger reads amortize scan setup and the per-block mapping advice.
+    let block = block_override.unwrap_or(if large_input { 4 * BLOCK } else { BLOCK }).max(4096);
+    let give_back = tune("SS_RELEASE", u64::from(large_input)) != 0;
+    let mut work = Vec::new();
+    for (file, (source, events)) in files.iter().enumerate() {
+        // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
+        for copy in 0..copies {
+            let mut start = 0;
+            while start < source.size {
+                let end = (start + block).min(source.size);
+                work.push(Work { events: *events, copy: copy << 56, file, start, end });
+                start = end;
+            }
+        }
+    }
+    let files = files.into_iter().map(|(source, _)| source).collect();
     // Small inputs waste pages when every worker opens thousands of partial chunks.
     // Grow the partition count with input size to keep large hash tables cacheable.
-    let input_bytes: u64 = files.iter().map(|source| source.size).sum();
-    let partition_bits = input_bytes.div_ceil(8 << 20).max(threads as u64 * 8).ilog2();
+    let partition_bits = input_bytes.div_ceil(4 << 20).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
