@@ -68,3 +68,23 @@ jobs:
           du -sh data-cache/d60
       - name: Benchmark
         run: DATA=d60 CASES=bench/cases60.txt RUNS=3 bash bench/run.sh
+
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Profile
+        run: |
+          sudo apt-get install -y -qq valgrind >/dev/null 2>&1
+          curl -fsSL -o generator.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          unzip -q generator.zip -d gen && (cd gen/generator && cargo build --release 2>&1 | tail -1)
+          gen/generator/target/release/generate --seed 7 --events 2000000 --clicks 500000 --output /dev/shm/d2
+          cd native
+          RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false cargo build --release 2>&1 | tail -1
+          mkdir -p /dev/shm/o
+          DATA_DIR=/dev/shm/d2 OUTPUT_DIR=/dev/shm/o NCPU=1 SS_RELEASE=0 valgrind --tool=callgrind --dump-instr=no --callgrind-out-file=/tmp/cg.out target/release/shopping-sessions 2>&1 | tail -5
+          callgrind_annotate --auto=yes --threshold=99.9 /tmp/cg.out src/main.rs src/scan.rs src/ts.rs src/keys.rs src/pq.rs > /tmp/ann.txt 2>&1 || true
+          head -60 /tmp/ann.txt
+          echo "=== lines"
+          awk '/^-- Auto-annotated source: /{f=$NF} /^ *[0-9,]+ \( *[0-9.]+%\)/{n=$1; gsub(",","",n); if (n+0 > 15000000) print f": "$0}' /tmp/ann.txt | cut -c1-230
