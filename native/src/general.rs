@@ -393,7 +393,7 @@ pub fn huge<T>(start: *const T, count: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
-            fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+            fn madvise(address: *mut u8, length: usize, advice: i32) -> i32;
         }
         const MADV_HUGEPAGE: i32 = 14;
         let bytes = count * std::mem::size_of::<T>();
@@ -420,7 +420,7 @@ fn populate<T>(start: *const T, count: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
-            fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+            fn madvise(address: *mut u8, length: usize, advice: i32) -> i32;
         }
         const STRETCH: usize = 1 << 21;
         let first = start as usize;
@@ -439,7 +439,7 @@ pub fn release<T>(start: *const T, count: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
-            fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+            fn madvise(address: *mut u8, length: usize, advice: i32) -> i32;
         }
         let bytes = count * std::mem::size_of::<T>();
         let from = (start as usize + 4095) & !4095;
@@ -554,7 +554,6 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     for path in &shared.link_files {
         let source = Source::open(path, true)?;
-        source.advise_huge();
         let size = source.size;
         let mut start = 0;
         while start < size {
@@ -1294,7 +1293,6 @@ pub fn run(data: &Path, output: &Path, threads: usize) -> io::Result<()> {
     for (folder, events) in [("events", true), ("clicks", false)] {
         for path in csv_files(&data.join(folder))? {
             let source = Source::open(&path, map)?;
-            source.advise_huge();
             let size = source.size;
             // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
             for copy in 0..copies {

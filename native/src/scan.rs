@@ -16,15 +16,15 @@ const SLACK: usize = 1 << 16;
 
 unsafe extern "C" {
     fn mmap(
-        address: *mut std::ffi::c_void,
+        address: *mut u8,
         length: usize,
         protection: i32,
         flags: i32,
         fd: i32,
         offset: i64,
-    ) -> *mut std::ffi::c_void;
+    ) -> *mut u8;
     #[cfg(target_os = "linux")]
-    fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+    fn madvise(address: *mut u8, length: usize, advice: i32) -> i32;
 }
 
 /// An input file, mapped when it can be.
@@ -62,6 +62,8 @@ impl Source {
             map: mapped,
         })
     }
+
+    pub fn advise_huge(&self) {}
 
     /// Unmaps the pages of `[start, end)` now, from whichever thread calls. Left
     /// mapped, the kernel would unmap the whole file on one thread at exit,
