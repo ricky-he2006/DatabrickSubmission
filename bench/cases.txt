@@ -1,11 +1,4 @@
 base|base|
-k|k|
-t|t|
-s|s|
-kt|kt|
-kts|kts|
+split|split|
 1:base|base|NCPU=1
-1:k|k|NCPU=1
-1:t|t|NCPU=1
-1:s|s|NCPU=1
-1:kts|kts|NCPU=1
+1:split|split|NCPU=1

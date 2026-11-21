@@ -11,11 +11,10 @@ git worktree add -q /tmp/base origin/a 2>/dev/null || true
 (cd "$ROOT/native" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8; cargo build --release 2>&1 | tail -1)
 BASE=/tmp/base/native/target/release/shopping-sessions
 NEW=$ROOT/native/target/release/shopping-sessions
-for v in k t s kt kts; do
-  rm -rf /tmp/v_$v && cp -r /tmp/base/native /tmp/v_$v && rm -rf /tmp/v_$v/target
-  case $v in *k*) cp bench/src/keys.rs /tmp/v_$v/src/;; esac
-  case $v in *t*) cp bench/src/ts.rs /tmp/v_$v/src/;; esac
-  case $v in *s*) cp bench/src/scan.rs /tmp/v_$v/src/;; esac
+# Each bench/v/NAME/ holds source files that replace the baseline's.
+for d in bench/v/*/; do
+  v=$(basename $d)
+  rm -rf /tmp/v_$v && cp -r /tmp/base/native /tmp/v_$v && rm -rf /tmp/v_$v/target && cp $d/* /tmp/v_$v/src/
   (cd /tmp/v_$v && cargo build --release 2>&1 | grep -E "^error" -A8; cargo build --release 2>&1 | tail -1)
 done
 bench() {
@@ -31,7 +30,7 @@ for round in $(seq "$RUNS"); do
   for i in "${!names[@]}"; do
     name=${names[$i]}; eval "which=\$W_$i"; eval "envs=\$E_$i"
     case "$name" in 1:*) [ "$round" -gt 3 ] && continue;; esac
-    bin=$NEW; [ "$which" = base ] && bin=$BASE; case "$which" in k|t|s|kt|kts) bin=/tmp/v_$which/target/release/shopping-sessions;; esac
+    bin=$NEW; [ "$which" = base ] && bin=$BASE; [ -d /tmp/v_$which ] && bin=/tmp/v_$which/target/release/shopping-sessions
     rm -rf /dev/shm/out/*
     start=$(date +%s%N)
     out=$(env DATA_DIR=/dev/shm/$D OUTPUT_DIR=/dev/shm/out NCPU=4 $envs "$bin" 2>&1)
