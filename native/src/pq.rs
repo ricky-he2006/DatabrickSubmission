@@ -226,14 +226,20 @@ impl Writer {
             path: path.to_path_buf(),
             columns: columns
                 .iter()
-                .map(|&(name, kind)| Column {
-                    name,
-                    kind,
-                    bytes: Vec::new(),
-                    runs: Vec::new(),
-                    last_key: 0,
-                    present: Vec::new(),
-                    ints: Vec::new(),
+                .map(|&(name, kind)| {
+                    let ints_cap = match kind {
+                        Kind::Date | Kind::Int32 | Kind::Int64 => group_rows,
+                        _ => 0,
+                    };
+                    Column {
+                        name,
+                        kind,
+                        bytes: Vec::new(),
+                        runs: Vec::new(),
+                        last_key: 0,
+                        present: Vec::new(),
+                        ints: Vec::with_capacity(ints_cap),
+                    }
                 })
                 .collect(),
             dictionary: plain,
@@ -241,7 +247,11 @@ impl Writer {
             rows: 0,
             group_rows,
             groups: Vec::new(),
-            out: b"PAR1".to_vec(),
+            out: {
+                let mut v = Vec::with_capacity(8 * 1024 * 1024);
+                v.extend_from_slice(b"PAR1");
+                v
+            },
         })
     }
 

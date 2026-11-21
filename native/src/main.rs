@@ -558,6 +558,7 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     for path in &shared.link_files {
         let source = Source::open(path, true)?;
+        source.advise_huge();
         let size = source.size;
         let mut start = 0;
         while start < size {
@@ -1304,6 +1305,7 @@ fn main() -> io::Result<()> {
     for (folder, events) in [("events", true), ("clicks", false)] {
         for path in csv_files(&data.join(folder))? {
             let source = Source::open(&path, map)?;
+            source.advise_huge();
             let size = source.size;
             // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
             for copy in 0..copies {

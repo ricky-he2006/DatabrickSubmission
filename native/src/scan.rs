@@ -47,6 +47,11 @@ impl Source {
             let address = unsafe { mmap(std::ptr::null_mut(), size as usize, 1, 2, file.as_raw_fd(), 0) };
             if address as usize != usize::MAX {
                 mapped = address as *const u8;
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    madvise(address, size as usize, 14); // MADV_HUGEPAGE
+                    madvise(address, size as usize, 3);  // MADV_WILLNEED
+                }
             }
         }
         Ok(Self {
@@ -54,6 +59,17 @@ impl Source {
             size,
             map: mapped,
         })
+    }
+
+    #[inline(always)]
+    pub fn advise_huge(&self) {
+        #[cfg(target_os = "linux")]
+        if !self.map.is_null() && self.size > 0 {
+            unsafe {
+                madvise(self.map as *mut _, self.size as usize, 14); // MADV_HUGEPAGE
+                madvise(self.map as *mut _, self.size as usize, 3);  // MADV_WILLNEED
+            }
+        }
     }
 
     /// Unmaps the pages of `[start, end)` now, from whichever thread calls. Left
