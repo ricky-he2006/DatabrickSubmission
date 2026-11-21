@@ -237,11 +237,6 @@ impl Block {
         self.own_end = own;
         if !source.map.is_null() && end + SLACK as u64 <= source.size {
             self.base = unsafe { source.map.add(start as usize) };
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let from = self.base as usize & !4095;
-                madvise(from as *mut _, self.base as usize + own + 4096 - from, 22);
-            }
             let tail = unsafe { std::slice::from_raw_parts(self.base.add(own), SLACK - 4 * PAD) };
             if let Some(at) = tail.iter().position(|&byte| byte == b'\n') {
                 self.end = own + at + 1;
