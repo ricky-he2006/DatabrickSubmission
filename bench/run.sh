@@ -23,7 +23,7 @@ done < bench/cases.txt
 for round in $(seq "$RUNS"); do
   for i in "${!names[@]}"; do
     name=${names[$i]}; eval "which=\$W_$i"; eval "envs=\$E_$i"
-    case "$name" in 1:*) [ "$round" -gt 2 ] && continue;; esac
+    case "$name" in 1:*) [ "$round" -gt 3 ] && continue;; esac
     bin=$NEW; [ "$which" = base ] && bin=$BASE; [ "$which" = alt ] && bin=$ALT
     rm -rf /dev/shm/out/*
     start=$(date +%s%N)

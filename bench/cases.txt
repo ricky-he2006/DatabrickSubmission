@@ -1,19 +1,16 @@
 # name|binary (base = origin/a, new = this tree, alt = this tree with the fused scanner)|environment
-base|base|
 new|new|
 alt|alt|
-index|new|SS_MODE=1
 lines|new|SS_MODE=2
 alt-lines|alt|SS_MODE=2
-nopush|new|SS_MODE=3
-alt-nopush|alt|SS_MODE=3
-nowrite|new|SS_NOWRITE=1
-huge0|new|SS_HUGE=0
-ncpu8|new|NCPU=8
 1:new|new|NCPU=1
 1:alt|alt|NCPU=1
 1:index|new|NCPU=1 SS_MODE=1
 1:lines|new|NCPU=1 SS_MODE=2
 1:alt-lines|alt|NCPU=1 SS_MODE=2
+1:id|new|NCPU=1 SS_MODE=31
+1:ingest|new|NCPU=1 SS_MODE=32
+1:user|new|NCPU=1 SS_MODE=33
+1:ts|new|NCPU=1 SS_MODE=34
 1:nopush|new|NCPU=1 SS_MODE=3
 1:alt-nopush|alt|NCPU=1 SS_MODE=3

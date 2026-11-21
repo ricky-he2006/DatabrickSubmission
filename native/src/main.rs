@@ -588,6 +588,7 @@ fn person_part(person: u64, bits: u32) -> usize {
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut Buckets<Parsed>) {
     let id_shift = 64 - shared.id_bits;
+    let mode = shared.mode;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -602,6 +603,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             return;
         }
         let id = id ^ copy;
+        if mode == 31 {
+            std::hint::black_box(id);
+            return;
+        }
         let (p, n) = field(3);
         let ingest = ts::parse(p, n, dates);
         if ingest == ts::BAD {
@@ -609,9 +614,21 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         }
         let (p, n) = field(1);
         let user = keys::pack(p, n);
+        if mode == 32 {
+            std::hint::black_box((id, ingest));
+            return;
+        }
         let user = if user == 0 { 0 } else { user ^ copy };
+        if mode == 33 {
+            std::hint::black_box((id, ingest, user));
+            return;
+        }
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
+        if mode == 34 {
+            std::hint::black_box((id, ingest, user, at));
+            return;
+        }
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
@@ -644,7 +661,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        if shared.mode == 3 {
+        if mode == 3 {
             // Benchmark mode 3: parse everything, store nothing.
             std::hint::black_box(record);
             return;
