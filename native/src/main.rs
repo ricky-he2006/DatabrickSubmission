@@ -1331,6 +1331,10 @@ fn main() -> io::Result<()> {
         }
     }
 
+    // Small inputs waste pages when every worker opens thousands of partial chunks.
+    // Grow the partition count with input size to keep large hash tables cacheable.
+    let input_bytes: u64 = files.iter().map(|source| source.size).sum();
+    let partition_bits = input_bytes.div_ceil(8 << 20).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
@@ -1346,8 +1350,8 @@ fn main() -> io::Result<()> {
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
-        id_bits: tune("SS_ID_BITS", ID_BITS as u64).clamp(1, 16) as u32,
-        person_bits: tune("SS_PERSON_BITS", PERSON_BITS as u64).clamp(1, 16) as u32,
+        id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
+        person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
         links: OnceLock::new(),
         output,
@@ -1390,7 +1394,7 @@ fn main() -> io::Result<()> {
             .map(|buckets| buckets.parts[part as usize].chunks as u64)
             .sum::<u64>()
     };
-    order.sort_by_key(|&part| std::cmp::Reverse(weight(part)));
+    order.sort_by_cached_key(|&part| std::cmp::Reverse(weight(part)));
     let order = &order;
     let next = AtomicUsize::new(0);
     let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {
