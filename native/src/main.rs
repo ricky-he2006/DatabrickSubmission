@@ -10,6 +10,7 @@
 //! 3. Sessions. Each person bucket is grouped, sorted, sessionized and
 //!    attributed, and its `user_daily` rows are written by the thread itself.
 
+mod diag;
 mod keys;
 mod pq;
 mod scan;
@@ -17,7 +18,7 @@ mod ts;
 
 use scan::{Block, Source};
 use std::cmp::Ordering as Order;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,8 @@ const WEEK: i64 = 7 * DAY;
 const SESSION_GAP: u64 = 1_800_000;
 /// Bytes of CSV a thread takes at a time.
 const BLOCK: u64 = 1 << 19;
+/// Bytes of a links file read at a time.
+const LINK_BLOCK: u64 = 1 << 19;
 /// Bytes of a mapped file a thread unmaps at a time, once parsing is over.
 const SEGMENT: u64 = 1 << 25;
 const ID_BITS: u32 = 11;
@@ -111,6 +114,7 @@ impl<T: Copy> Buckets<T> {
             self.slabs.push(slab);
         }
         let base = self.base(chunk as u32);
+        populate(base, CHUNK);
         let slot = &mut self.parts[part];
         slot.chunks += 1;
         self.previous.push(slot.head);
@@ -213,14 +217,13 @@ impl Dim {
     }
 
     fn insert(&mut self, name: &[u8], value: u32) {
-        let mut padded = name.to_vec();
-        padded.extend_from_slice(&[0; 16]);
-        let number = unsafe { ts::numbered(padded.as_ptr(), name.len(), self.prefix) };
+        // `numbered` reads only the name's own bytes.
+        let number = unsafe { ts::numbered(name.as_ptr(), name.len(), self.prefix) };
         if number == usize::MAX {
             self.other.insert(name.to_vec(), value);
         } else {
             if self.dense.len() <= number {
-                self.dense.resize(number + 1, 0);
+                self.dense.resize((number + 1).max(self.dense.len() * 2), 0);
             }
             self.dense[number] = value;
         }
@@ -375,8 +378,35 @@ pub fn huge<T>(start: *const T, count: usize) {
         let bytes = count * std::mem::size_of::<T>();
         let from = (start as usize + 4095) & !4095;
         let to = (start as usize + bytes) & !4095;
-        if to > from + (1 << 21) {
+        if to > from + (1 << 21) && HUGE.load(Ordering::Relaxed) != 0 {
             madvise(from as *mut _, to - from, MADV_HUGEPAGE);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (start, count);
+}
+
+/// Tunables the diagnostic run flips; the defaults are what a scored run uses.
+pub static HUGE: AtomicUsize = AtomicUsize::new(1);
+/// How long the one thread that builds the links table spent on it.
+static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
+pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
+
+/// With `POPULATE` on: when `count` values at `start` begin a new 2 MB stretch,
+/// fault the whole stretch in with one call (MADV_POPULATE_WRITE).
+#[inline(always)]
+fn populate<T>(start: *const T, count: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        unsafe extern "C" {
+            fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+        }
+        const STRETCH: usize = 1 << 21;
+        let first = start as usize;
+        let last = first + count * std::mem::size_of::<T>() - 1;
+        if POPULATE.load(Ordering::Relaxed) != 0 && (first / STRETCH != last / STRETCH || first % STRETCH < 8192) {
+            let from = last & !(STRETCH - 1);
+            madvise(from as *mut _, STRETCH, 23);
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -420,6 +450,9 @@ fn prefetch<T>(target: &T) {
 
 struct Work {
     events: bool,
+    /// Diagnostic runs parse the data several times over; this copy's number
+    /// is mixed into its IDs so the copies do not collapse into duplicates.
+    copy: u64,
     file: usize,
     start: u64,
     end: u64,
@@ -438,6 +471,9 @@ struct Shared {
     work: Vec<Work>,
     next: AtomicUsize,
     link_files: Vec<PathBuf>,
+    id_bits: u32,
+    person_bits: u32,
+    ahead: usize,
     links: OnceLock<Links>,
     output: PathBuf,
     /// Days from the first day a session can start on to the last, inclusive.
@@ -500,7 +536,7 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
         let size = source.size;
         let mut start = 0;
         while start < size {
-            let end = (start + BLOCK).min(size);
+            let end = (start + LINK_BLOCK).min(size);
             block.load(&source, start, end)?;
             block.lines::<2>(|buf, fields| unsafe {
                 let a = keys::pack(buf.add(fields[0].0 as usize), (fields[0].1 - fields[0].0) as usize);
@@ -516,11 +552,12 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
 }
 
 #[inline(always)]
-fn person_part(person: u64) -> usize {
-    (person.wrapping_mul(MIX) >> (64 - PERSON_BITS)) as usize
+fn person_part(person: u64, bits: u32) -> usize {
+    (person.wrapping_mul(MIX) >> (64 - bits)) as usize
 }
 
-fn parse_events(shared: &Shared, block: &Block, dates: &mut ts::Dates, out: &mut Buckets<Parsed>) {
+fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut Buckets<Parsed>) {
+    let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
@@ -534,6 +571,7 @@ fn parse_events(shared: &Shared, block: &Block, dates: &mut ts::Dates, out: &mut
         if id == 0 {
             return;
         }
+        let id = id ^ copy;
         let (p, n) = field(3);
         let ingest = ts::parse(p, n, dates);
         if ingest == ts::BAD {
@@ -541,6 +579,7 @@ fn parse_events(shared: &Shared, block: &Block, dates: &mut ts::Dates, out: &mut
         }
         let (p, n) = field(1);
         let user = keys::pack(p, n);
+        let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
         let (p, n) = field(4);
@@ -575,13 +614,14 @@ fn parse_events(shared: &Shared, block: &Block, dates: &mut ts::Dates, out: &mut
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.push((id.wrapping_mul(MIX) >> (64 - ID_BITS)) as usize, record);
+        out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
     });
 }
 
 fn parse_clicks(
     shared: &Shared,
     block: &Block,
+    copy: u64,
     dates: &mut ts::Dates,
     pending: &mut Vec<RawClick>,
     out: &mut Buckets<Click>,
@@ -598,6 +638,7 @@ fn parse_clicks(
         if id == 0 || user == 0 {
             return;
         }
+        let (id, user) = (id ^ copy, user ^ copy);
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
@@ -619,13 +660,13 @@ fn parse_clicks(
         }
     };
     for at in 0..pending.len() {
-        if let Some(ahead) = pending.get(at + AHEAD) {
+        if let Some(ahead) = pending.get(at + shared.ahead) {
             links.prefetch(ahead.user);
         }
         let click = pending[at];
         let person = links.person(click.user);
         out.push(
-            person_part(person),
+            person_part(person, shared.person_bits),
             Click {
                 person,
                 id: click.id,
@@ -640,22 +681,24 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     let mut block = Block::new();
     if first {
         // The other threads wait on this table, so a failure must not leave them waiting.
+        let began = Instant::now();
         let links = read_links(shared, &mut block).unwrap_or_else(|error| {
             eprintln!("links: {error}");
             std::process::exit(1);
         });
+        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = Buckets::new(1 << ID_BITS);
-    let mut clicks = Buckets::new(1 << PERSON_BITS);
+    let mut events = Buckets::new(1 << shared.id_bits);
+    let mut clicks = Buckets::new(1 << shared.person_bits);
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
-            parse_events(shared, &block, &mut dates, &mut events);
+            parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
     Ok((events, clicks))
@@ -665,12 +708,13 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
 
 fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize) -> Buckets<Event> {
     let links = shared.links.get().unwrap();
-    let mut out = Buckets::new(1 << PERSON_BITS);
+    let mut out = Buckets::new(1 << shared.person_bits);
+    let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut table: Vec<u32> = Vec::new();
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
-        if part >= 1 << ID_BITS {
+        if part >= 1 << shared.id_bits {
             break;
         }
         chunks.clear();
@@ -714,8 +758,8 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
             }
             for &(base, count) in &chunks {
                 for offset in 0..count {
-                    if offset + AHEAD < count {
-                        links.prefetch((*base.add(offset + AHEAD)).user);
+                    if offset + ahead < count {
+                        links.prefetch((*base.add(offset + ahead)).user);
                     }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
@@ -723,7 +767,7 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     }
                     let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person), Event { person, value });
+                    out.push(person_part(person, person_bits), Event { person, value });
                 }
             }
         }
@@ -734,12 +778,12 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
 // ---------------------------------------------------------------- phase 3
 
 const USER_COLUMNS: [(&str, pq::Kind); 6] = [
-    ("user_id", pq::Kind::Text),
+    ("user_id", pq::Kind::Keyed),
     ("day", pq::Kind::Date),
     ("sessions", pq::Kind::Int32),
     ("events", pq::Kind::Int32),
     ("revenue_cents", pq::Kind::Int64),
-    ("top_category", pq::Kind::OptionalText),
+    ("top_category", pq::Kind::Category),
 ];
 
 /// Per campaign and day: credited sessions, of those purchasing, revenue, assists.
@@ -766,19 +810,19 @@ impl Sessions<'_> {
                 .output
                 .join("user_daily")
                 .join(format!("part-{:03}.parquet", self.thread));
-            self.writer = Some(pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS)?);
+            self.writer = Some(pq::Writer::create(
+                &path,
+                &USER_COLUMNS,
+                GROUP_ROWS,
+                &shared.categories,
+            )?);
         }
         let writer = self.writer.as_mut().unwrap();
-        let name = writer.raw(0);
-        let at = name.len();
-        name.extend_from_slice(&[0; 4]);
-        keys::unpack(person, name);
-        let length = (name.len() - at - 4) as u32;
-        name[at..at + 4].copy_from_slice(&length.to_le_bytes());
-        writer.int32(1, (shared.first_day + day as i64) as i32);
-        writer.int32(2, sessions as i32);
-        writer.int32(3, events as i32);
-        writer.int64(4, revenue as i64);
+        writer.keyed(0, person, |name| keys::unpack(person, name));
+        writer.int(1, shared.first_day + day as i64);
+        writer.int(2, sessions as i64);
+        writer.int(3, events as i64);
+        writer.int(4, revenue as i64);
         let mut top: Option<usize> = None;
         for &category in &self.touched {
             let category = category as usize;
@@ -792,8 +836,9 @@ impl Sessions<'_> {
             self.sums[category as usize] = 0;
         }
         self.touched.clear();
-        writer.optional_text(5, top.map(|category| shared.categories[category].as_slice()));
-        writer.end_row()
+        writer.category(5, top.map(|category| category as u8));
+        writer.end_row();
+        Ok(())
     }
 
     /// One person: their events sorted by time, their clicks by time then ID.
@@ -1133,8 +1178,24 @@ fn session_worker(
 
 // ---------------------------------------------------------------- main
 
+fn tune(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn main() -> io::Result<()> {
     let began = Instant::now();
+    if std::env::var_os("SS_DIAG").is_some() && std::env::var_os("SS_CHILD").is_none() {
+        diag::run();
+    }
+    HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
+    POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
+    let block = tune("SS_BLOCK", BLOCK).max(4096);
+    let map = tune("SS_MAP", 1) != 0;
+    let give_back = tune("SS_RELEASE", 1) != 0;
+    let copies = tune("SS_COPIES", 1).clamp(1, 100);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = std::env::var("NCPU")
@@ -1153,23 +1214,47 @@ fn main() -> io::Result<()> {
     );
 
     // Categories are numbered in byte order, so the smaller number wins a tie.
-    let product_rows = read_pairs(&data.join("products.csv"))?;
-    let mut names: BTreeSet<&[u8]> = product_rows.iter().map(|row| row.1.as_slice()).collect();
-    names.insert(b"unknown");
-    let categories: Vec<Vec<u8>> = names.iter().map(|name| name.to_vec()).collect();
-    assert!(categories.len() <= 256, "more than 256 categories");
+    // Products, without an allocation per row: categories are numbered as they
+    // appear, then renumbered in byte order so the smaller number wins a tie.
+    let mut seen: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
     let mut products = Dim::new(b"p");
-    for (product, category) in &product_rows {
-        if !product.is_empty() {
-            let index = categories
-                .binary_search_by(|name| name.as_slice().cmp(category))
-                .unwrap();
-            products.insert(product, index as u32 + 1);
+    {
+        let source = Source::open(&data.join("products.csv"), false)?;
+        if source.size > 0 {
+            let mut block = Block::new();
+            block.load(&source, 0, source.size)?;
+            block.lines::<2>(|buf, fields| unsafe {
+                let text = |at: usize| {
+                    std::slice::from_raw_parts(buf.add(fields[at].0 as usize), (fields[at].1 - fields[at].0) as usize)
+                };
+                let (product, category) = (text(0), text(1));
+                if product.is_empty() {
+                    return;
+                }
+                let index = match seen.iter().position(|name| name.as_slice() == category) {
+                    Some(index) => index,
+                    None => {
+                        seen.push(category.to_vec());
+                        seen.len() - 1
+                    }
+                };
+                products.insert(product, index as u32 + 1);
+            });
         }
     }
-    let unknown = categories
-        .binary_search_by(|name| name.as_slice().cmp(b"unknown"))
-        .unwrap() as u32;
+    assert!(seen.len() <= 256, "more than 256 categories");
+    let mut categories = seen.clone();
+    categories.sort();
+    let renumber: Vec<u32> = seen
+        .iter()
+        .map(|name| categories.binary_search(name).unwrap() as u32 + 1)
+        .collect();
+    for value in products.dense.iter_mut().chain(products.other.values_mut()) {
+        if *value != 0 {
+            *value = renumber[*value as usize - 1];
+        }
+    }
+    let unknown = renumber[0] - 1;
 
     let mut campaigns = Dim::new(b"c_");
     let mut campaign_names = vec![b"organic".to_vec()];
@@ -1186,18 +1271,22 @@ fn main() -> io::Result<()> {
     let mut work = Vec::new();
     for (folder, events) in [("events", true), ("clicks", false)] {
         for path in csv_files(&data.join(folder))? {
-            let source = Source::open(&path, true)?;
+            let source = Source::open(&path, map)?;
             let size = source.size;
-            let mut start = 0;
-            while start < size {
-                let end = (start + BLOCK).min(size);
-                work.push(Work {
-                    events,
-                    file: files.len(),
-                    start,
-                    end,
-                });
-                start = end;
+            // An ID's first byte sits in the key's top 7 bits; a copy flips some of them.
+            for copy in 0..copies {
+                let mut start = 0;
+                while start < size {
+                    let end = (start + block).min(size);
+                    work.push(Work {
+                        events,
+                        copy: copy << 56,
+                        file: files.len(),
+                        start,
+                        end,
+                    });
+                    start = end;
+                }
             }
             files.push(source);
         }
@@ -1218,6 +1307,9 @@ fn main() -> io::Result<()> {
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
+        id_bits: tune("SS_ID_BITS", ID_BITS as u64).clamp(1, 16) as u32,
+        person_bits: tune("SS_PERSON_BITS", PERSON_BITS as u64).clamp(1, 16) as u32,
+        ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
         links: OnceLock::new(),
         output,
         days: ((window_end - 1).div_euclid(DAY) - first_day + 1) as usize,
@@ -1252,7 +1344,7 @@ fn main() -> io::Result<()> {
     let parsed_events = &parsed_events;
 
     // Biggest person buckets first, so a whale's is never the last one running.
-    let mut order: Vec<u32> = (0..1u32 << PERSON_BITS).collect();
+    let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
     let weight = |part: u32| {
         events
             .iter()
@@ -1268,7 +1360,7 @@ fn main() -> io::Result<()> {
                 let (events, clicks, next) = (&events, &clicks, &next);
                 scope.spawn(move || {
                     // The parsed events are done with: free them alongside.
-                    if let Some(done) = parsed_events.get(thread) {
+                    if let Some(done) = parsed_events.get(thread).filter(|_| give_back) {
                         done.release();
                     }
                     session_worker(shared, events, clicks, order, next, thread)
@@ -1284,7 +1376,7 @@ fn main() -> io::Result<()> {
 
     if !results.iter().any(|result| result.1) {
         let path = shared.output.join("user_daily").join("part-000.parquet");
-        pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS)?.finish()?;
+        pq::Writer::create(&path, &USER_COLUMNS, GROUP_ROWS, &shared.categories)?.finish()?;
     }
     let mut writer = pq::Writer::create(
         &shared.output.join("campaign_daily").join("part-000.parquet"),
@@ -1298,6 +1390,7 @@ fn main() -> io::Result<()> {
             ("assisted_sessions", pq::Kind::Int64),
         ],
         GROUP_ROWS,
+        &[],
     )?;
     for campaign in 0..shared.campaign_names.len() {
         for day in 0..shared.days {
@@ -1313,12 +1406,12 @@ fn main() -> io::Result<()> {
             }
             writer.text(0, &shared.campaign_names[campaign]);
             writer.text(1, &shared.campaign_channels[campaign]);
-            writer.int32(2, (shared.first_day + day as i64) as i32);
-            writer.int64(3, sum[0]);
-            writer.int64(4, sum[1]);
-            writer.int64(5, sum[2]);
-            writer.int64(6, sum[3]);
-            writer.end_row()?;
+            writer.int(2, shared.first_day + day as i64);
+            writer.int(3, sum[0]);
+            writer.int(4, sum[1]);
+            writer.int(5, sum[2]);
+            writer.int(6, sum[3]);
+            writer.end_row();
         }
     }
     writer.finish()?;
@@ -1333,9 +1426,12 @@ fn main() -> io::Result<()> {
             start += SEGMENT;
         }
     }
+    if !give_back {
+        segments.clear();
+    }
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        for thread in 0..threads {
+        for thread in 0..threads.min(if give_back { threads } else { 0 }) {
             let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
             scope.spawn(move || {
                 events[thread].release();
@@ -1345,18 +1441,19 @@ fn main() -> io::Result<()> {
                 }
             });
         }
-        if let Some(links) = shared.links.get() {
+        if let Some(links) = shared.links.get().filter(|_| give_back) {
             crate::release(links.slots.as_ptr(), links.slots.len());
         }
     });
     let total = began.elapsed();
     eprintln!(
-        "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} total={:.3}",
+        "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
         setup.as_secs_f64(),
         (parse - setup).as_secs_f64(),
         (dedup - parse).as_secs_f64(),
         (sessions - dedup).as_secs_f64(),
         (total - sessions).as_secs_f64(),
+        LINKS_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
         total.as_secs_f64()
     );
     // Everything left is memory the kernel frees faster than we can.

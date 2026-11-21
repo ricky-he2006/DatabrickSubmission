@@ -34,7 +34,8 @@ kernel, which would otherwise free them on a single thread inside the timed run.
 - `native/src/scan.rs`: block loading and the CSV structural index.
 - `native/src/keys.rs`: IDs as sortable 64-bit keys.
 - `native/src/ts.rs`: timestamps and prices.
-- `native/src/pq.rs`: a minimal Parquet writer (PLAIN, uncompressed).
+- `native/src/pq.rs`: a small Parquet writer (delta and dictionary encodings, one write per file).
+- `native/src/diag.rs`: a diagnostic mode (`SS_DIAG`) that benchmarks variants on the machine it runs on.
 - `tools/reference.py`: a slow, literal implementation of the rules, for checking.
 - `tools/compare.py`: exact diff of an output folder against expected CSVs.
 
