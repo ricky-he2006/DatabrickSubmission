@@ -1,11 +1,8 @@
-# name|binary|environment
+base|base|
 new|new|
-load|new|SS_MODE=0
-floor|new|SS_MODE=1
 lines|new|SS_MODE=2
 nopush|new|SS_MODE=3
+1:base|base|NCPU=1
 1:new|new|NCPU=1
-1:load|new|NCPU=1 SS_MODE=0
-1:floor|new|NCPU=1 SS_MODE=1
 1:lines|new|NCPU=1 SS_MODE=2
 1:nopush|new|NCPU=1 SS_MODE=3

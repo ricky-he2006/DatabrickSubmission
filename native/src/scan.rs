@@ -167,49 +167,6 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
     }
 }
 
-/// Whether to try the whole-line path first (cargo feature `wide`).
-const WIDE: bool = cfg!(feature = "wide");
-
-/// For the 128 bytes at `p`: which are a comma or newline, which a newline, which a quote.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline(always)]
-unsafe fn wide(p: *const u8) -> (u128, u128, u128) {
-    unsafe {
-        use std::arch::x86_64::*;
-        let (comma, newline, quote) = (
-            _mm256_set1_epi8(b',' as i8),
-            _mm256_set1_epi8(b'\n' as i8),
-            _mm256_set1_epi8(b'"' as i8),
-        );
-        let (mut ends, mut newlines, mut quotes) = (0u128, 0u128, 0u128);
-        for part in 0..4 {
-            let v = _mm256_loadu_si256(p.add(part * 32) as *const __m256i);
-            let n = _mm256_cmpeq_epi8(v, newline);
-            let e = _mm256_or_si256(_mm256_cmpeq_epi8(v, comma), n);
-            let q = _mm256_cmpeq_epi8(v, quote);
-            ends |= (_mm256_movemask_epi8(e) as u32 as u128) << (part * 32);
-            newlines |= (_mm256_movemask_epi8(n) as u32 as u128) << (part * 32);
-            quotes |= (_mm256_movemask_epi8(q) as u32 as u128) << (part * 32);
-        }
-        (ends, newlines, quotes)
-    }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-#[inline(always)]
-unsafe fn wide(p: *const u8) -> (u128, u128, u128) {
-    unsafe {
-        let (mut ends, mut newlines, mut quotes) = (0u128, 0u128, 0u128);
-        for at in 0..128 {
-            let byte = *p.add(at);
-            ends |= u128::from(byte == b',' || byte == b'\n') << at;
-            newlines |= u128::from(byte == b'\n') << at;
-            quotes |= u128::from(byte == b'"') << at;
-        }
-        (ends, newlines, quotes)
-    }
-}
-
 #[cold]
 #[inline(never)]
 unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
@@ -320,91 +277,191 @@ impl Block {
             let Some(mut newline) = head.iter().position(|&byte| byte == b'\n') else {
                 return;
             };
-            while newline < own_end && newline + 1 < end {
-                fetch(buf.wrapping_add(newline + READ_AHEAD));
-                fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
-                let mut fields = [(0u32, 0u32); N];
-                let mut well_formed = false;
-                let mut general = true;
-                if WIDE {
-                    // The whole line at once: its first 128 bytes as bit masks, and
-                    // every field read off them with no branch that depends on the
-                    // data. Anything unusual (a long line, the wrong number of
-                    // fields) falls through to the general loop below.
-                    let line = newline + 1;
-                    let (ends, newlines, quotes) = wide(buf.add(line));
-                    let mut rest = ends;
-                    let mut from = 0u32;
-                    let mut stop = 0u32;
-                    let mut fine = true;
-                    let mut quoted = 0u32;
-                    for slot in fields.iter_mut() {
-                        stop = rest.trailing_zeros();
-                        let opens = (quotes >> (from & 127)) as u32 & 1;
-                        let closes = (quotes >> (stop.wrapping_sub(1) & 127)) as u32 & u32::from(stop >= from + 2);
-                        fine &= opens <= closes;
-                        quoted += opens;
-                        *slot = (line as u32 + from + opens, (line as u32 + stop).wrapping_sub(opens));
-                        from = stop + 1;
-                        rest &= rest.wrapping_sub(1);
+            let limit = (end + 63) & !63;
+            let mut index = Index::new(newline + 1);
+            // `at..have` are the separators found and not yet used.
+            let (mut at, mut have) = (0usize, 0usize);
+            let mut quotes_so_far = 0u32;
+            loop {
+                while at + N <= have {
+                    if newline >= own_end || newline + 1 >= end {
+                        return;
                     }
-                    // The Nth separator must be the line's newline, and the only
-                    // quotes on the line the ones that wrap a field.
-                    if stop < 128 && newlines.trailing_zeros() == stop {
-                        let inside = quotes & ((1u128 << stop) - 1);
-                        newline = line + stop as usize;
-                        // One call site for `visit`, shared with the general loop,
-                        // so that it is inlined.
-                        well_formed = fine && inside.count_ones() == 2 * quoted;
-                        general = false;
+                    let start = newline + 1;
+                    let last = *index.separators.get_unchecked(at + N - 1) as usize;
+                    let mut shaped = *buf.add(last) == b'\n';
+                    for field in 0..N - 1 {
+                        shaped &= *buf.add(*index.separators.get_unchecked(at + field) as usize) == b',';
+                    }
+                    let mut fields = [(0u32, 0u32); N];
+                    let ok;
+                    if shaped && index.done - start < (RING - 1) * 64 {
+                        let mut fine = true;
+                        let mut opened = 0u32;
+                        let mut from = start;
+                        for (field, slot) in fields.iter_mut().enumerate() {
+                            let stop = *index.separators.get_unchecked(at + field) as usize;
+                            let opens = u32::from(*buf.add(from) == b'"');
+                            let closes = u32::from(*buf.add(stop - 1) == b'"');
+                            fine &= opens == closes && (opens == 0 || stop - from >= 2);
+                            opened += opens;
+                            *slot = (from as u32 + opens, stop as u32 - opens);
+                            from = stop + 1;
+                        }
+                        let quotes = index.quotes_before(last);
+                        ok = fine && quotes.wrapping_sub(quotes_so_far) == 2 * opened;
+                        quotes_so_far = quotes;
+                        at += N;
+                        newline = last;
+                    } else {
+                        let (fine, stop) = odd_line(buf, start, &mut fields);
+                        ok = fine;
+                        newline = stop;
+                        // Find our place in the separators again, past that line.
+                        if stop >= index.done {
+                            while stop >= index.done && index.done < limit {
+                                have = index.more(buf, have, have, limit);
+                                at = 0;
+                            }
+                        }
+                        while at < have && *index.separators.get_unchecked(at) as usize <= stop {
+                            at += 1;
+                        }
+                        quotes_so_far = index.quotes_before(stop);
+                    }
+                    if ok {
+                        visit(buf, &fields);
                     }
                 }
-                if general {
-                    let mut count = 0usize;
-                    let mut ok = true;
-                    let mut start = newline + 1;
-                    let mut at = start;
-                    let (mut ends, mut quotes) = window(buf.add(at));
-                    loop {
-                        let mut shift = start - at;
-                        let mut rest = if shift < 64 { ends >> shift } else { 0 };
-                        if rest == 0 {
-                            at = start;
-                            (ends, quotes) = window(buf.add(at));
-                            shift = 0;
-                            rest = ends;
-                        }
-                        let (stop, fine, opens) = if rest != 0 {
-                            let length = rest.trailing_zeros();
-                            let inside = (quotes >> shift) & ((1u64 << length) - 1);
-                            let opens = inside & 1;
-                            let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
-                            (
-                                start + length as usize,
-                                inside == wanted && (opens == 0 || length >= 2),
-                                opens as usize,
-                            )
-                        } else {
-                            ends = 0;
-                            long_field(buf, start)
-                        };
-                        ok &= fine;
-                        if count < N {
-                            fields[count] = ((start + opens) as u32, (stop - opens) as u32);
-                        }
-                        count += 1;
-                        if *buf.add(stop) == b'\n' {
-                            newline = stop;
-                            break;
-                        }
-                        start = stop + 1;
-                    }
-                    well_formed = ok && count == N;
+                if index.done >= limit {
+                    return;
                 }
-                if well_formed {
-                    visit(buf, &fields);
-                }
+                have = index.more(buf, at, have, limit);
+                at = 0;
             }
+        }
+    }
+}
+
+/// 64-byte windows indexed at a time, and how many windows of quote counts are kept.
+const STRIP: usize = 64;
+const RING: usize = 256;
+
+/// The separators of the next few kilobytes, found ahead of the lines that use them.
+struct Index {
+    separators: [u32; STRIP * 64 + 128],
+    quote_bits: [u64; RING],
+    quotes_until: [u32; RING],
+    quotes: u32,
+    /// Bytes below this are indexed; a multiple of 64.
+    done: usize,
+    /// Clears the bits before the first line, in the first window only.
+    keep: u64,
+}
+
+impl Index {
+    #[inline(always)]
+    fn new(start: usize) -> Self {
+        Self {
+            separators: [0; STRIP * 64 + 128],
+            quote_bits: [0; RING],
+            quotes_until: [0; RING],
+            quotes: 0,
+            done: start & !63,
+            keep: !0u64 << (start & 63),
+        }
+    }
+
+    /// Quotes before byte `at`, which must be in the last `RING` windows.
+    #[inline(always)]
+    unsafe fn quotes_before(&self, at: usize) -> u32 {
+        unsafe {
+            let word = (at >> 6) & (RING - 1);
+            let below = *self.quote_bits.get_unchecked(word) & ((1u64 << (at & 63)) - 1);
+            self.quotes_until.get_unchecked(word).wrapping_add(below.count_ones())
+        }
+    }
+
+    /// Drops the used separators `..at`, indexes one more strip, and returns the new count.
+    #[inline(always)]
+    unsafe fn more(&mut self, buf: *const u8, at: usize, have: usize, limit: usize) -> usize {
+        unsafe {
+            let mut have = have - at;
+            if at > 0 && have > 0 {
+                self.separators.copy_within(at..at + have, 0);
+            }
+            let stop = (self.done + STRIP * 64).min(limit);
+            let out = self.separators.as_mut_ptr();
+            while self.done < stop {
+                fetch(buf.wrapping_add(self.done + READ_AHEAD));
+                let (ends, quotes) = window(buf.add(self.done));
+                let (mut ends, quotes) = (ends & self.keep, quotes & self.keep);
+                self.keep = !0;
+                let word = (self.done >> 6) & (RING - 1);
+                *self.quote_bits.get_unchecked_mut(word) = quotes;
+                *self.quotes_until.get_unchecked_mut(word) = self.quotes;
+                self.quotes = self.quotes.wrapping_add(quotes.count_ones());
+                let count = ends.count_ones() as usize;
+                let base = self.done as u32;
+                let mut to = out.add(have);
+                for _ in 0..8 {
+                    *to = base + ends.trailing_zeros();
+                    ends &= ends.wrapping_sub(1);
+                    to = to.add(1);
+                }
+                if count > 8 {
+                    for _ in 0..8 {
+                        *to = base + ends.trailing_zeros();
+                        ends &= ends.wrapping_sub(1);
+                        to = to.add(1);
+                    }
+                    while ends != 0 {
+                        *to = base + ends.trailing_zeros();
+                        ends &= ends.wrapping_sub(1);
+                        to = to.add(1);
+                    }
+                }
+                have += count;
+                self.done += 64;
+            }
+            have
+        }
+    }
+}
+
+/// One line the fast path would not take: its fields, whether it is a good
+/// line of `N` fields, and where its newline is.
+#[cold]
+#[inline(never)]
+unsafe fn odd_line<const N: usize>(buf: *const u8, first: usize, fields: &mut [(u32, u32); N]) -> (bool, usize) {
+    unsafe {
+        let mut count = 0usize;
+        let mut ok = true;
+        let mut start = first;
+        loop {
+            let (ends, quotes) = window(buf.add(start));
+            let (stop, fine, opens) = if ends != 0 {
+                let length = ends.trailing_zeros();
+                let inside = quotes & ((1u64 << length) - 1);
+                let opens = inside & 1;
+                let wanted = opens * (1 | 1u64.wrapping_shl(length.wrapping_sub(1)));
+                (
+                    start + length as usize,
+                    inside == wanted && (opens == 0 || length >= 2),
+                    opens as usize,
+                )
+            } else {
+                long_field(buf, start)
+            };
+            ok &= fine;
+            if count < N {
+                fields[count] = ((start + opens) as u32, (stop - opens) as u32);
+            }
+            count += 1;
+            if *buf.add(stop) == b'\n' {
+                return (ok && count == N, stop);
+            }
+            start = stop + 1;
         }
     }
 }
