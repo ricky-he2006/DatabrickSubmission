@@ -29,7 +29,7 @@ for d in bench/v/*/; do
   (cd /tmp/v_$v && RUSTFLAGS="$F" cargo build --release 2>&1 | grep -E "^error" -A8; RUSTFLAGS="$F" cargo build --release 2>&1 | tail -1)
 done
 bench() {
-RUNS=${RUNS:-5}
+RUNS=${RUNS:-3}
 declare -A best line; unset names
 names=()
 while IFS='|' read -r name which envs; do

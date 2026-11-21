@@ -1,7 +1,2 @@
-base|base|
 cur|cur|
-ahead8|cur|SS_AHEAD=8
-ahead32|cur|SS_AHEAD=32
-ahead64|cur|SS_AHEAD=64
-blk256k|cur|SS_BLOCK=262144
-blk1m|cur|SS_BLOCK=1048576
+1:tim|tim|NCPU=1
