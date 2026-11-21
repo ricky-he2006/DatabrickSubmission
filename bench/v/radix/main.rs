@@ -272,10 +272,6 @@ struct Links {
     slots: Vec<[u64; 2]>,
     shift: u32,
     empty: bool,
-    /// One bit per hash of every ID in `slots`, small enough to stay in cache:
-    /// most IDs that no link names are answered here, without touching `slots`.
-    filter: Vec<u64>,
-    filter_shift: u32,
 }
 
 impl Links {
@@ -359,49 +355,23 @@ impl Links {
                 entry[1] = smallest[find(&mut parent, entry[1] as u32) as usize];
             }
         }
-        // At 8 bits per ID or more, one in eight IDs that no link names gets past.
-        let filter_bits = (names.len() * FILTER.load(Ordering::Relaxed)).next_power_of_two().max(64);
-        let filter_shift = 64 - filter_bits.trailing_zeros();
-        let mut filter = vec![0u64; filter_bits / 64];
-        for &name in &names {
-            let bit = Self::filter_bit(name, filter_shift);
-            filter[bit / 64] |= 1 << (bit % 64);
-        }
         Self {
             slots,
             shift,
             empty: pairs.is_empty(),
-            filter,
-            filter_shift,
         }
-    }
-
-    /// The filter bit of `key`: another hash than the slot's.
-    #[inline(always)]
-    fn filter_bit(key: u64, shift: u32) -> usize {
-        ((key ^ (key >> 29)).wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift) as usize
-    }
-
-    /// Whether `key` may be in `slots`.
-    #[inline(always)]
-    fn may_hold(&self, key: u64) -> bool {
-        if self.filter.len() == 1 {
-            return true;
-        }
-        let bit = Self::filter_bit(key, self.filter_shift);
-        unsafe { (*self.filter.get_unchecked(bit / 64) >> (bit % 64)) & 1 != 0 }
     }
 
     #[inline(always)]
     fn prefetch(&self, key: u64) {
-        if !self.empty && self.may_hold(key) {
+        if !self.empty {
             prefetch(unsafe { self.slots.get_unchecked((key.wrapping_mul(MIX) >> self.shift) as usize) });
         }
     }
 
     #[inline(always)]
     fn person(&self, key: u64) -> u64 {
-        if self.empty || !self.may_hold(key) {
+        if self.empty {
             return key;
         }
         let mask = self.slots.len() - 1;
@@ -443,8 +413,6 @@ pub fn huge<T>(start: *const T, count: usize) {
 pub static HUGE: AtomicUsize = AtomicUsize::new(1);
 /// How long the one thread that builds the links table spent on it.
 static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
-/// Bits of the links filter per linked ID.
-pub static FILTER: AtomicUsize = AtomicUsize::new(8);
 pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
 
 /// With `POPULATE` on: when `count` values at `start` begin a new 2 MB stretch,
@@ -905,7 +873,7 @@ impl Sessions<'_> {
         Ok(())
     }
 
-    /// One person: their events sorted by time, their clicks by time then ID.
+    /// One person: their events and their clicks, each sorted by time.
     fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
         let days = self.shared.days;
         let day_offset = self.shared.day_offset;
@@ -978,10 +946,15 @@ impl Sessions<'_> {
                     low += 1;
                 }
                 if high > low {
+                    // Clicks are in time order only: of the latest, the smallest ID.
                     let latest = clicks[high - 1].ts;
                     let mut pick = high - 1;
-                    while pick > low && clicks[pick - 1].ts == latest {
-                        pick -= 1;
+                    let mut at = high - 1;
+                    while at > low && clicks[at - 1].ts == latest {
+                        at -= 1;
+                        if keys::compare(clicks[at].id, clicks[pick].id) == Order::Less {
+                            pick = at;
+                        }
                     }
                     credited = clicks[pick].campaign as usize;
                 }
@@ -1004,33 +977,55 @@ impl Sessions<'_> {
     }
 }
 
-/// Sorts many events of one person by their `ts` (the top 32 bits): three
-/// counting passes of 11 bits. Whales have a million events each.
-fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
-    scratch.clear();
-    scratch.resize(values.len(), 0);
-    let mut counts = [0u32; 2048];
-    let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
-    for shift in [32, 43, 54] {
-        counts.fill(0);
-        for &value in from.iter() {
-            counts[(value >> shift) as usize & 2047] += 1;
+/// Sorts `items`, and `tags` along with them, by `key` and stably: three
+/// counting passes of 11 bits. `spare` and `spare_tags` are scratch space.
+/// Branch-free, where sorting each person's few events on their own is not.
+fn sort_by_key32<T: Copy>(
+    items: &mut Vec<T>,
+    tags: &mut Vec<u32>,
+    spare: &mut Vec<T>,
+    spare_tags: &mut Vec<u32>,
+    key: impl Fn(&T) -> u32,
+) {
+    let total = items.len();
+    if total < 2 {
+        return;
+    }
+    let mut counts = [[0u32; 2048]; 3];
+    for item in items.iter() {
+        let at = key(item);
+        counts[0][at as usize & 2047] += 1;
+        counts[1][(at >> 11) as usize & 2047] += 1;
+        counts[2][(at >> 22) as usize] += 1;
+    }
+    spare.resize(total, items[0]);
+    spare_tags.resize(total, 0);
+    for (pass, shift) in [0u32, 11, 22].into_iter().enumerate() {
+        let counts = &mut counts[pass];
+        // A digit every item shares orders nothing.
+        if counts[(key(&items[0]) >> shift) as usize & 2047] as usize == total {
+            continue;
         }
-        let mut sum = 0;
+        let mut sum = 0u32;
         for count in counts.iter_mut() {
             let here = *count;
             *count = sum;
             sum += here;
         }
-        for &value in from.iter() {
-            let slot = &mut counts[(value >> shift) as usize & 2047];
-            to[*slot as usize] = value;
-            *slot += 1;
+        unsafe {
+            for at in 0..total {
+                let item = *items.get_unchecked(at);
+                let slot = counts.get_unchecked_mut((key(&item) >> shift) as usize & 2047);
+                *spare.get_unchecked_mut(*slot as usize) = item;
+                *spare_tags.get_unchecked_mut(*slot as usize) = *tags.get_unchecked(at);
+                *slot += 1;
+            }
         }
-        std::mem::swap(&mut from, &mut to);
+        spare.truncate(total);
+        spare_tags.truncate(total);
+        std::mem::swap(items, spare);
+        std::mem::swap(tags, spare_tags);
     }
-    // Three passes: the sorted values are in the scratch buffer.
-    to.copy_from_slice(from);
 }
 
 fn session_worker(
@@ -1064,7 +1059,12 @@ fn session_worker(
     let mut click_ends: Vec<u32> = Vec::new();
     let mut click_local: Vec<u32> = Vec::new();
     let mut touches: Vec<Touch> = Vec::new();
-    let mut scratch: Vec<u64> = Vec::new();
+    let mut gathered: Vec<u64> = Vec::new();
+    let mut spare_values: Vec<u64> = Vec::new();
+    let mut spare_tags: Vec<u32> = Vec::new();
+    let mut kept_touches: Vec<Touch> = Vec::new();
+    let mut kept_tags: Vec<u32> = Vec::new();
+    let mut spare_touches: Vec<Touch> = Vec::new();
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
@@ -1134,17 +1134,22 @@ fn session_worker(
                 *end = sum;
                 sum += count;
             }
+            // The bucket's events by time, then by person: the stable pass by
+            // person leaves each person's events in time order.
+            gathered.clear();
+            for &(base, count) in &event_chunks {
+                gathered.extend((0..count).map(|offset| (*base.add(offset)).value));
+            }
+            sort_by_key32(&mut gathered, &mut local, &mut spare_values, &mut spare_tags, |value| {
+                (value >> 32) as u32
+            });
             if values.len() < total {
                 values.resize(total, 0);
             }
-            let mut index = 0;
-            for &(base, count) in &event_chunks {
-                for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
-                    *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
-                    *end += 1;
-                    index += 1;
-                }
+            for (&value, &id) in gathered.iter().zip(local.iter()) {
+                let end = ends.get_unchecked_mut(id as usize);
+                *values.get_unchecked_mut(*end as usize) = value;
+                *end += 1;
             }
         }
 
@@ -1195,6 +1200,8 @@ fn session_worker(
                     },
                 );
             }
+            kept_touches.clear();
+            kept_tags.clear();
             let mut index = 0;
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
@@ -1202,15 +1209,20 @@ fn session_worker(
                     index += 1;
                     if id != NONE {
                         let click = *base.add(offset);
-                        let end = click_ends.get_unchecked_mut(id as usize);
-                        *touches.get_unchecked_mut(*end as usize) = Touch {
+                        kept_touches.push(Touch {
                             id: click.id,
                             ts: click.ts,
                             campaign: click.campaign,
-                        };
-                        *end += 1;
+                        });
+                        kept_tags.push(id);
                     }
                 }
+            }
+            sort_by_key32(&mut kept_touches, &mut kept_tags, &mut spare_touches, &mut spare_tags, |touch| touch.ts);
+            for (&touch, &id) in kept_touches.iter().zip(kept_tags.iter()) {
+                let end = click_ends.get_unchecked_mut(id as usize);
+                *touches.get_unchecked_mut(*end as usize) = touch;
+                *end += 1;
             }
         }
 
@@ -1218,17 +1230,7 @@ fn session_worker(
         for (id, &person) in persons.iter().enumerate() {
             let to = ends[id] as usize;
             let click_to = click_ends[id] as usize;
-            let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
-            } else {
-                mine.sort_unstable();
-            }
-            let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
-            }
-            sessions.person(person, mine, reached)?;
+            sessions.person(person, &values[from..to], &touches[click_from..click_to])?;
             from = to;
             click_from = click_to;
         }
@@ -1256,7 +1258,6 @@ fn main() -> io::Result<()> {
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
-    FILTER.store(tune("SS_FILTER", 8) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
     let map = tune("SS_MAP", 1) != 0;
     let give_back = tune("SS_RELEASE", 1) != 0;
