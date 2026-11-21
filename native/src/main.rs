@@ -643,17 +643,10 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     });
 }
 
-fn parse_clicks(
-    shared: &Shared,
-    block: &Block,
-    copy: u64,
-    dates: &mut ts::Dates,
-    pending: &mut Vec<RawClick>,
-    out: &mut Buckets<Click>,
-) {
+fn parse_clicks(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut Buckets<Click>) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
-    pending.clear();
+    let bits = shared.person_bits;
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -671,35 +664,17 @@ fn parse_clicks(
         if campaign == 0 || at < earliest || at >= window_end {
             return;
         }
-        pending.push(RawClick {
-            user,
-            id,
-            ts: (at - earliest) as u32,
-            campaign,
-        });
-    });
-    let links = loop {
-        match shared.links.get() {
-            Some(links) => break links,
-            None => std::thread::yield_now(),
-        }
-    };
-    for at in 0..pending.len() {
-        if let Some(ahead) = pending.get(at + shared.ahead) {
-            links.prefetch(ahead.user);
-        }
-        let click = pending[at];
-        let person = links.person(click.user);
+        // The person is looked up later, a partition at a time.
         out.push(
-            person_part(person, shared.person_bits),
+            person_part(user, bits),
             Click {
-                person,
-                id: click.id,
-                ts: click.ts,
-                campaign: click.campaign,
+                person: user,
+                id,
+                ts: (at - earliest) as u32,
+                campaign,
             },
         );
-    }
+    });
 }
 
 fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Buckets<Click>)> {
@@ -716,14 +691,13 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     }
     let mut events = Buckets::new(1 << shared.id_bits);
     let mut clicks = Buckets::new(1 << shared.person_bits);
-    let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
             parse_events(shared, &block, work.copy, &mut dates, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            parse_clicks(shared, &block, work.copy, &mut dates, &mut clicks);
         }
     }
     Ok((events, clicks))
@@ -732,11 +706,10 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
 // ---------------------------------------------------------------- phase 2
 
 fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize) -> Buckets<Event> {
-    let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
-    let (ahead, person_bits) = (shared.ahead, shared.person_bits);
+    let person_bits = shared.person_bits;
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut table: Vec<u32> = Vec::new();
     loop {
@@ -786,18 +759,22 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
                     }
                 }
             }
+            // The person is looked up later, a partition at a time: for now
+            // `person` holds the user.
             for &(base, count) in &chunks {
                 for offset in 0..count {
-                    if offset + ahead < count {
-                        links.prefetch((*base.add(offset + ahead)).user);
-                    }
                     let record = *base.add(offset);
                     if record.ts == DEAD {
                         continue;
                     }
-                    let person = links.person(record.user);
                     let value = ((record.ts as u64) << 32) | record.payload as u64;
-                    out.push(person_part(person, person_bits), Event { person, value });
+                    out.push(
+                        person_part(record.user, person_bits),
+                        Event {
+                            person: record.user,
+                            value,
+                        },
+                    );
                 }
             }
             // Every record of this bucket has been read: its chunks are free.
@@ -807,6 +784,72 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         }
     }
     out
+}
+
+// ---------------------------------------------------------------- phase 2b
+
+/// Replaces each user with their person and regroups by the person's partition.
+/// Users come a partition at a time, and the links table puts a key's slot by
+/// the same top bits of the same hash: each partition's lookups stay inside
+/// one small stretch of the table, in cache, where lookups in ID order would
+/// each miss it.
+fn resolve_worker(
+    shared: &Shared,
+    events_in: &[Buckets<Event>],
+    clicks_in: &[Buckets<Click>],
+    next: &AtomicUsize,
+) -> (Buckets<Event>, Buckets<Click>) {
+    let links = shared.links.get().unwrap();
+    let bits = shared.person_bits;
+    let mut events = Buckets::new(1 << bits);
+    let mut clicks = Buckets::new(1 << bits);
+    let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
+    let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
+    loop {
+        let part = next.fetch_add(1, Ordering::Relaxed);
+        if part >= 1 << bits {
+            break;
+        }
+        event_chunks.clear();
+        for source in events_in {
+            source.chunks(part, &mut event_chunks);
+        }
+        unsafe {
+            for &(base, count) in &event_chunks {
+                for offset in 0..count {
+                    let event = *base.add(offset);
+                    let person = links.person(event.person);
+                    events.push(
+                        person_part(person, bits),
+                        Event {
+                            person,
+                            value: event.value,
+                        },
+                    );
+                }
+            }
+        }
+        for &(base, _) in &event_chunks {
+            events.donate(base as *mut u8);
+        }
+        click_chunks.clear();
+        for source in clicks_in {
+            source.chunks(part, &mut click_chunks);
+        }
+        unsafe {
+            for &(base, count) in &click_chunks {
+                for offset in 0..count {
+                    let mut click = *base.add(offset);
+                    click.person = links.person(click.person);
+                    clicks.push(person_part(click.person, bits), click);
+                }
+            }
+        }
+        for &(base, _) in &click_chunks {
+            clicks.donate(base as *mut u8);
+        }
+    }
+    (events, clicks)
 }
 
 // ---------------------------------------------------------------- phase 3
@@ -1393,6 +1436,18 @@ fn main() -> io::Result<()> {
     let dedup = began.elapsed();
     let parsed_events = &parsed_events;
 
+    let next = AtomicUsize::new(0);
+    let users = (&events, &clicks);
+    let resolved: Vec<(Buckets<Event>, Buckets<Click>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| scope.spawn(|| resolve_worker(shared, users.0, users.1, &next)))
+            .collect();
+        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+    });
+    let (unresolved_events, unresolved_clicks) = (events, clicks);
+    let (events, clicks): (Vec<_>, Vec<_>) = resolved.into_iter().unzip();
+    let resolve = began.elapsed();
+
     // Biggest person buckets first, so a whale's is never the last one running.
     let mut order: Vec<u32> = (0..1u32 << shared.person_bits).collect();
     let weight = |part: u32| {
@@ -1477,12 +1532,15 @@ fn main() -> io::Result<()> {
     std::thread::scope(|scope| {
         for thread in 0..threads.min(if give_back { threads } else { 0 }) {
             let (events, clicks, segments, next) = (&events, &clicks, &segments, &next);
+            let (unresolved_events, unresolved_clicks) = (&unresolved_events, &unresolved_clicks);
             let parsed_events = &parsed_events;
             scope.spawn(move || {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].release();
                 events[thread].release();
                 clicks[thread].release();
+                unresolved_events[thread].release();
+                unresolved_clicks[thread].release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
@@ -1494,11 +1552,12 @@ fn main() -> io::Result<()> {
     });
     let total = began.elapsed();
     eprintln!(
-        "setup={:.3} parse={:.3} dedup={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
+        "setup={:.3} parse={:.3} dedup={:.3} resolve={:.3} sessions={:.3} write={:.3} links={:.3} total={:.3}",
         setup.as_secs_f64(),
         (parse - setup).as_secs_f64(),
         (dedup - parse).as_secs_f64(),
-        (sessions - dedup).as_secs_f64(),
+        (resolve - dedup).as_secs_f64(),
+        (sessions - resolve).as_secs_f64(),
         (total - sessions).as_secs_f64(),
         LINKS_MICROS.load(Ordering::Relaxed) as f64 / 1e6,
         total.as_secs_f64()
