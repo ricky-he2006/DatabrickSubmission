@@ -731,6 +731,13 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(Buckets<Parsed>, Bu
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
+        if shared.mode == 0 {
+            continue;
+        }
+        if shared.mode == 1 {
+            std::hint::black_box(block.count());
+            continue;
+        }
         // Benchmark mode 2: stop after splitting lines.
         if shared.mode == 2 {
             let mut sum = 0u64;

@@ -300,6 +300,17 @@ impl Block {
         Ok(())
     }
 
+    /// Benchmark: the newlines and commas of the block, and nothing else.
+    pub fn count(&self) -> u64 {
+        let mut total = 0u64;
+        let mut at = 0;
+        while at < self.end {
+            total += unsafe { window(self.base.add(at)) }.0.count_ones() as u64;
+            at += 64;
+        }
+        total
+    }
+
     #[inline(always)]
     pub fn lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, &[(u32, u32); N])) {
         let buf = self.base;
