@@ -557,6 +557,22 @@ pub fn release<T>(start: *const T, count: usize) {
     let _ = (start, count);
 }
 
+/// Cache lines of the next chunk to prefetch when starting one (0 = off).
+/// Chunks of a bucket are scattered, so each one starts with misses.
+static CHUNK_AHEAD: AtomicUsize = AtomicUsize::new(0);
+
+#[inline(always)]
+fn warm<T>(chunks: &[(*mut T, usize)], index: usize) {
+    let lines = CHUNK_AHEAD.load(Ordering::Relaxed);
+    if lines != 0 {
+        if let Some(&(next, _)) = chunks.get(index + 1) {
+            for line in 0..lines {
+                prefetch(unsafe { &*(next as *const u8).wrapping_add(line * 64) });
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn prefetch<T>(target: &T) {
     #[cfg(target_arch = "x86_64")]
@@ -900,6 +916,7 @@ fn dedup_worker(shared: &Shared, sources: &[Buckets<Parsed>], next: &AtomicUsize
         table.resize(capacity, NONE);
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
+                warm(&chunks, index);
                 for offset in 0..count {
                     let record = base.add(offset);
                     let id = (*record).id;
@@ -1197,7 +1214,8 @@ fn session_worker(
         ends.clear();
         local.clear();
         unsafe {
-            for &(base, count) in &event_chunks {
+            for (index, &(base, count)) in event_chunks.iter().enumerate() {
+                warm(&event_chunks, index);
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
@@ -1268,7 +1286,8 @@ fn session_worker(
         click_local.clear();
         let mut kept = 0usize;
         unsafe {
-            for &(base, count) in &click_chunks {
+            for (index, &(base, count)) in click_chunks.iter().enumerate() {
+                warm(&click_chunks, index);
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
                     let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
@@ -1387,6 +1406,7 @@ fn main() -> io::Result<()> {
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     scan::READ_AHEAD.store(tune("SS_READ_AHEAD", 0) as usize, Ordering::Relaxed);
+    CHUNK_AHEAD.store(tune("SS_CHUNK_AHEAD", 0) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
     let map = tune("SS_MAP", 1) != 0;

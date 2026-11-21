@@ -1,21 +1,19 @@
 # name|binary (base = origin/a, new = this tree, alt = this tree with the fused scanner)|environment
-new|new|SS_STAGE=0
-new-ra1k|new|SS_STAGE=0 SS_READ_AHEAD=1024
-new-ra4k|new|SS_STAGE=0 SS_READ_AHEAD=4096
-new-map0|new|SS_STAGE=0 SS_MAP=0
+base|base|
 alt|alt|SS_STAGE=0
+alt-ra256|alt|SS_STAGE=0 SS_READ_AHEAD=256
+alt-ra512|alt|SS_STAGE=0 SS_READ_AHEAD=512
 alt-ra1k|alt|SS_STAGE=0 SS_READ_AHEAD=1024
-alt-ra4k|alt|SS_STAGE=0 SS_READ_AHEAD=4096
-alt-map0|alt|SS_STAGE=0 SS_MAP=0
-index|new|SS_MODE=1
-index-ra4k|new|SS_MODE=1 SS_READ_AHEAD=4096
-index-map0|new|SS_MODE=1 SS_MAP=0
-altl|alt|SS_MODE=2
-altl-ra4k|alt|SS_MODE=2 SS_READ_AHEAD=4096
-altl-map0|alt|SS_MODE=2 SS_MAP=0
-1:index|new|NCPU=1 SS_MODE=1
-1:index-ra4k|new|NCPU=1 SS_MODE=1 SS_READ_AHEAD=4096
-1:index-map0|new|NCPU=1 SS_MODE=1 SS_MAP=0
-1:altl|alt|NCPU=1 SS_MODE=2
-1:altl-ra4k|alt|NCPU=1 SS_MODE=2 SS_READ_AHEAD=4096
-1:altl-map0|alt|NCPU=1 SS_MODE=2 SS_MAP=0
+alt-ra2k|alt|SS_STAGE=0 SS_READ_AHEAD=2048
+alt-ra8k|alt|SS_STAGE=0 SS_READ_AHEAD=8192
+alt-ra1k-c4|alt|SS_STAGE=0 SS_READ_AHEAD=1024 SS_CHUNK_AHEAD=4
+alt-ra1k-c16|alt|SS_STAGE=0 SS_READ_AHEAD=1024 SS_CHUNK_AHEAD=16
+alt-ra1k-c64|alt|SS_STAGE=0 SS_READ_AHEAD=1024 SS_CHUNK_AHEAD=64
+alt-ra1k-st1|alt|SS_STAGE=1 SS_READ_AHEAD=1024
+alt-ra1k-m0|alt|SS_STAGE=0 SS_READ_AHEAD=1024 SS_MAP=0
+new-ra1k|new|SS_STAGE=0 SS_READ_AHEAD=1024
+new-ra1k-c16|new|SS_STAGE=0 SS_READ_AHEAD=1024 SS_CHUNK_AHEAD=16
+1:alt|alt|NCPU=1 SS_STAGE=0
+1:alt-ra1k|alt|NCPU=1 SS_STAGE=0 SS_READ_AHEAD=1024
+1:alt-ra1k-c16|alt|NCPU=1 SS_STAGE=0 SS_READ_AHEAD=1024 SS_CHUNK_AHEAD=16
+1:new-ra1k|new|NCPU=1 SS_STAGE=0 SS_READ_AHEAD=1024
