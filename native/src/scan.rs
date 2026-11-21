@@ -167,6 +167,49 @@ unsafe fn window(p: *const u8) -> (u64, u64) {
     }
 }
 
+/// Whether to try the whole-line path first (cargo feature `wide`).
+const WIDE: bool = cfg!(feature = "wide");
+
+/// For the 128 bytes at `p`: which are a comma or newline, which a newline, which a quote.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn wide(p: *const u8) -> (u128, u128, u128) {
+    unsafe {
+        use std::arch::x86_64::*;
+        let (comma, newline, quote) = (
+            _mm256_set1_epi8(b',' as i8),
+            _mm256_set1_epi8(b'\n' as i8),
+            _mm256_set1_epi8(b'"' as i8),
+        );
+        let (mut ends, mut newlines, mut quotes) = (0u128, 0u128, 0u128);
+        for part in 0..4 {
+            let v = _mm256_loadu_si256(p.add(part * 32) as *const __m256i);
+            let n = _mm256_cmpeq_epi8(v, newline);
+            let e = _mm256_or_si256(_mm256_cmpeq_epi8(v, comma), n);
+            let q = _mm256_cmpeq_epi8(v, quote);
+            ends |= (_mm256_movemask_epi8(e) as u32 as u128) << (part * 32);
+            newlines |= (_mm256_movemask_epi8(n) as u32 as u128) << (part * 32);
+            quotes |= (_mm256_movemask_epi8(q) as u32 as u128) << (part * 32);
+        }
+        (ends, newlines, quotes)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn wide(p: *const u8) -> (u128, u128, u128) {
+    unsafe {
+        let (mut ends, mut newlines, mut quotes) = (0u128, 0u128, 0u128);
+        for at in 0..128 {
+            let byte = *p.add(at);
+            ends |= u128::from(byte == b',' || byte == b'\n') << at;
+            newlines |= u128::from(byte == b'\n') << at;
+            quotes |= u128::from(byte == b'"') << at;
+        }
+        (ends, newlines, quotes)
+    }
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn long_field(buf: *const u8, start: usize) -> (usize, bool, usize) {
@@ -270,6 +313,39 @@ impl Block {
                 fetch(buf.wrapping_add(newline + READ_AHEAD));
                 fetch(buf.wrapping_add(newline + READ_AHEAD + 64));
                 let mut fields = [(0u32, 0u32); N];
+                if WIDE {
+                    // The whole line at once: its first 128 bytes as bit masks, and
+                    // every field read off them with no branch that depends on the
+                    // data. Anything unusual (a long line, the wrong number of
+                    // fields) falls through to the general loop below.
+                    let line = newline + 1;
+                    let (ends, newlines, quotes) = wide(buf.add(line));
+                    let mut rest = ends;
+                    let mut from = 0u32;
+                    let mut stop = 0u32;
+                    let mut fine = true;
+                    let mut quoted = 0u32;
+                    for slot in fields.iter_mut() {
+                        stop = rest.trailing_zeros();
+                        let opens = (quotes >> (from & 127)) as u32 & 1;
+                        let closes = (quotes >> (stop.wrapping_sub(1) & 127)) as u32 & u32::from(stop >= from + 2);
+                        fine &= opens <= closes;
+                        quoted += opens;
+                        *slot = (line as u32 + from + opens, (line as u32 + stop).wrapping_sub(opens));
+                        from = stop + 1;
+                        rest &= rest.wrapping_sub(1);
+                    }
+                    // The Nth separator must be the line's newline, and the only
+                    // quotes on the line the ones that wrap a field.
+                    if stop < 128 && newlines.trailing_zeros() == stop {
+                        let inside = quotes & ((1u128 << stop) - 1);
+                        if fine && inside.count_ones() == 2 * quoted {
+                            visit(buf, &fields);
+                        }
+                        newline = line + stop as usize;
+                        continue;
+                    }
+                }
                 let mut count = 0usize;
                 let mut ok = true;
                 let mut start = newline + 1;

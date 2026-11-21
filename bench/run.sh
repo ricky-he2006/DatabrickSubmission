@@ -10,7 +10,8 @@ git worktree add -q /tmp/base origin/a 2>/dev/null || true
 (cd "$ROOT/native" && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8; cargo build --release 2>&1 | tail -1)
 BASE=/tmp/base/native/target/release/shopping-sessions
 NEW=$ROOT/native/target/release/shopping-sessions
-ALT=$NEW
+(cd "$ROOT/native" && cargo build --release --features wide --target-dir /tmp/alt 2>&1 | tail -1)
+ALT=/tmp/alt/release/shopping-sessions
 RUNS=${RUNS:-5}
 declare -A best line
 names=()

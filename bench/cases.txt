@@ -1,11 +1,11 @@
-# name|binary (base = origin/a, new = this tree)|environment
+# name|binary (base = origin/a, new = this tree, alt = this tree with the whole-line splitter)|environment
 new|new|
+alt|alt|
 lines|new|SS_MODE=2
+alt-lines|alt|SS_MODE=2
 nopush|new|SS_MODE=3
-nopers|new|SS_MODE=5
-nowrite|new|SS_NOWRITE=1
-ncpu8|new|NCPU=8
+alt-nopush|alt|SS_MODE=3
 1:new|new|NCPU=1
+1:alt|alt|NCPU=1
 1:lines|new|NCPU=1 SS_MODE=2
-1:nopush|new|NCPU=1 SS_MODE=3
-1:nopers|new|NCPU=1 SS_MODE=5
+1:alt-lines|alt|NCPU=1 SS_MODE=2
