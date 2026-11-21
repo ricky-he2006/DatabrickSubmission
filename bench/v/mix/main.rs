@@ -413,8 +413,6 @@ pub fn huge<T>(start: *const T, count: usize) {
 pub static HUGE: AtomicUsize = AtomicUsize::new(1);
 /// How long the one thread that builds the links table spent on it.
 static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
-pub static MODE: AtomicUsize = AtomicUsize::new(0);
-pub static SINK: AtomicUsize = AtomicUsize::new(0);
 pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
 
 /// With `POPULATE` on: when `count` values at `start` begin a new 2 MB stretch,
@@ -591,18 +589,6 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     let window_start = shared.window_start;
     let window_end = shared.window_end;
     let ingest_base = window_start - 10 * DAY;
-    let mode = MODE.load(Ordering::Relaxed);
-    if mode >= 4 {
-        SINK.fetch_add(block.floor(mode) as usize, Ordering::Relaxed);
-        return;
-    }
-    let mut sink = 0u64;
-    if mode == 1 {
-        let mut n = 0u64;
-        block.raw_lines::<7>(|_buf, start, seps| { n += seps[6] as u64 ^ start as u64; });
-        SINK.fetch_add(n as usize, Ordering::Relaxed);
-        return;
-    }
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -620,7 +606,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let user = keys::pack(p, n);
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
-        let at = ts::parse(p, n, dates);
+        let at = ts::parse_mixed(p, n, dates);
         let (p, n) = field(4);
         let purchase = n == 8 && (p as *const u64).read_unaligned() == PURCHASE.to_le();
         let other = n == 4 && {
@@ -653,13 +639,8 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        if mode == 3 {
-            sink ^= record.id ^ record.user ^ record.ts as u64 ^ record.payload as u64 ^ record.ingest as u64;
-        } else {
-            out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
-        }
+        out.push((id.wrapping_mul(MIX) >> id_shift) as usize, record);
     });
-    SINK.fetch_add(sink as usize, Ordering::Relaxed);
 }
 
 fn parse_clicks(
@@ -686,7 +667,7 @@ fn parse_clicks(
         let (p, n) = field(2);
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
-        let at = ts::parse(p, n, dates);
+        let at = ts::parse_mixed(p, n, dates);
         if campaign == 0 || at < earliest || at >= window_end {
             return;
         }
@@ -1260,7 +1241,6 @@ fn main() -> io::Result<()> {
         diag::run();
     }
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
-    MODE.store(tune("SS_MODE", 0) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
     let map = tune("SS_MAP", 1) != 0;

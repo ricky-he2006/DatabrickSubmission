@@ -1,9 +1,6 @@
 base|base|
-m6|fl|SS_MODE=6
-m4|fl|SS_MODE=4
-m5|fl|SS_MODE=5
-m1|fl|SS_MODE=1
-m3|fl|SS_MODE=3
-1:m6|fl|NCPU=1 SS_MODE=6
-1:m4|fl|NCPU=1 SS_MODE=4
-1:m5|fl|NCPU=1 SS_MODE=5
+mix|mix|
+base2|base|
+mix2|mix|
+1:base|base|NCPU=1
+1:mix|mix|NCPU=1
