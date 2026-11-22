@@ -2136,7 +2136,7 @@ pub fn stage1(g: &G, tid: usize) {
             // Populate only this worker's file range, including the page
             // containing the first row. An unsupported hint is harmless.
             let start = (c.a - 1) & !4095;
-            unsafe { madvise(g.region.add(f.off + start), c.b - start, 22) };
+            unsafe { madvise(g.region.add(f.off + start).cast_mut(), c.b - start, 22) };
         }
         let s = if c.a == f.hdr { c.a } else { next_line_start(data, c.a - 1) };
         let e = if c.b >= f.len { f.len } else { next_line_start(data, c.b - 1) };
