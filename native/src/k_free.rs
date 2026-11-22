@@ -1275,20 +1275,27 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let t = blsr(w1c);
         let c1 = tz2(t);
         let c2 = tz(blsr(t));
-        let tb = bzhi(wbc, m);
-        let z = _lzcnt_u64(tb);
-        let r6 = lea3::<-64>(m, z);
-        let t = tb.wrapping_shl(z as u32) << 1;
-        let r5 = _lzcnt_u64(t);
-        let t = t.wrapping_shl(r5 as u32) << 1;
-        let r4 = _lzcnt_u64(t);
-        let zr = z.wrapping_add(r5);
-        let i4 = lea3::<1>(zr, r4) ^ 63;
-        let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
-        if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) {
+        // The shortest supported ingest timestamp occupies 20 bytes. Look for
+        // its delimiter and the two trailing delimiters in forward order.
+        let first = c2.wrapping_add(21).wrapping_sub(FB as u64);
+        if first >= 64 || m > 63 || (TAIL && pb.wrapping_add(m as usize) >= cx.end) {
             return None;
         }
-        core::arch::asm!("test {u}, -3", "jnz {fail}", u = in(reg) u3, fail = label { return None; }, options(nomem, nostack));
+        let tail = wbc >> first;
+        let after_kind_start = blsr(tail);
+        let after_product_start = blsr(after_kind_start);
+        let a = tz2(tail);
+        let b = tz2(after_kind_start);
+        let c = tz2(after_product_start);
+        let last = first + c;
+        if (a & !2) != 0 || last >= m || first + tz2(blsr(after_product_start)) < m {
+            return None;
+        }
+        let i4 = first + a + 1;
+        let u3 = a;
+        let r4 = b - a - 1;
+        let r5 = c - b - 1;
+        let r6 = m - last - 1;
         let tr = &*((T.tail.as_ptr() as *const u8).add((here(r5 * TAIL_K as u64 + r6) as usize) << 6) as *const TailRow);
         let q32 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(pb.wrapping_add(m as usize).wrapping_sub(32) as *const __m256i), _mm256_set1_epi8(b'"' as i8))) as u32;
         let qw = q32 & tr.m;
