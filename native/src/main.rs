@@ -606,7 +606,59 @@ struct EventSource {
     names: Vec<[u8; 33]>,
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+// Combine scattered 32-byte records into contiguous partition writes. Every
+// source flushes its partial groups before the dedup workers start reading.
+struct EventGroups {
+    records: Vec<[Parsed; 4]>,
+    count: Vec<u8>,
+}
+
+impl EventGroups {
+    fn new(parts: usize) -> Self {
+        let empty = Parsed { id: 0, user: 0, ingest: 0, ts: DEAD, payload: 0 };
+        Self { records: vec![[empty; 4]; parts], count: vec![0; parts] }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, buckets: &mut Buckets<Parsed>, part: usize, row: Parsed) {
+        let count = self.count[part] as usize;
+        self.records[part][count] = row;
+        if count == 3 {
+            Self::append(buckets, part, &self.records[part]);
+            self.count[part] = 0;
+        } else {
+            self.count[part] = (count + 1) as u8;
+        }
+    }
+
+    #[inline(always)]
+    fn append(buckets: &mut Buckets<Parsed>, part: usize, rows: &[Parsed]) {
+        let mut dest = buckets.next[part];
+        let mut left = rows;
+        while !left.is_empty() {
+            let mut used = dest as usize & (CHUNK_BYTES - 1);
+            if used == Buckets::<Parsed>::FILL {
+                dest = buckets.grow(part);
+                used = 0;
+            }
+            let n = left.len().min((Buckets::<Parsed>::FILL - used) / std::mem::size_of::<Parsed>());
+            unsafe {
+                std::ptr::copy_nonoverlapping(left.as_ptr(), dest, n);
+                dest = dest.add(n);
+            }
+            left = &left[n..];
+        }
+        buckets.next[part] = dest;
+    }
+
+    fn finish(self, buckets: &mut Buckets<Parsed>) {
+        for (part, count) in self.count.into_iter().enumerate() {
+            Self::append(buckets, part, &self.records[part][..count as usize]);
+        }
+    }
+}
+
+fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource, groups: &mut EventGroups) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -672,7 +724,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
-        out.buckets.push((partition_hash >> id_shift) as usize, record);
+        groups.push(&mut out.buckets, (partition_hash >> id_shift) as usize, record);
     });
 }
 
@@ -774,17 +826,19 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         let _ = shared.links.set(links);
     }
     let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut groups = EventGroups::new(1 << shared.id_bits);
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
-            parse_events(shared, &block, work.copy, &mut dates, &mut events);
+            parse_events(shared, &block, work.copy, &mut dates, &mut events, &mut groups);
         } else {
             parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
         }
     }
+    groups.finish(&mut events.buckets);
     Ok((events, clicks))
 }
 
