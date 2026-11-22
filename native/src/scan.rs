@@ -212,6 +212,37 @@ unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) 
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vbmi2")]
+unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let data = _mm512_loadu_si512(p.cast());
+    let newline = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'\n' as i8));
+    let commas = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b',' as i8));
+    let quotes = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(b'"' as i8));
+    (commas | newline, newline, quotes)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vbmi2")]
+unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    use std::arch::x86_64::*;
+    const OFFSETS: [u8; 64] = {
+        let mut a = [0; 64];
+        let mut i = 0;
+        while i < 64 { a[i] = i as u8; i += 1; }
+        a
+    };
+    let n = bits.count_ones() as usize;
+    if n > 16 {
+        return flatten::<10>(bits, base, out);
+    }
+    let packed = _mm512_maskz_compress_epi8(bits, _mm512_loadu_si512(OFFSETS.as_ptr().cast()));
+    let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
+    _mm512_storeu_si512(out.cast(), _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
+    n
+}
+
 /// Chunks of 64 bytes indexed before their lines are handed out.
 const WINDOW: usize = 64;
 
@@ -431,7 +462,22 @@ impl Block {
     /// breaks one of these sends its lines down the old path, which says
     /// exactly which are wrong.
     #[inline(always)]
-    pub fn raw_lines<const N: usize>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
+    pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
+            return unsafe { self.raw_wide(visit) };
+        }
+        self.raw_indexed::<N, false>(visit)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vbmi2")]
+    unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
+        self.raw_indexed::<N, true>(visit)
+    }
+
+    #[inline(always)]
+    fn raw_indexed<const N: usize, const WIDE: bool>(&self, mut visit: impl FnMut(*const u8, u32, &[u32; N])) {
         let buf = self.base;
         let (own_end, end) = (self.own_end, self.end);
         unsafe {
@@ -468,7 +514,11 @@ impl Block {
                 while at < stop_at {
                     let p = buf.add(at as usize);
                     fetch(p.wrapping_add(READ_AHEAD));
-                    let (mut sep, mut newline, mut quote) = classes(p);
+                    #[cfg(target_arch = "x86_64")]
+                    let classified = if WIDE { wide_classes(p) } else { classes(p) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let classified = classes(p);
+                    let (mut sep, mut newline, mut quote) = classified;
                     let left = end - at;
                     if left < 64 {
                         let valid = (1u64 << left) - 1;
@@ -504,7 +554,11 @@ impl Block {
                             bad.push(at);
                         }
                     }
-                    count += flatten::<10>(sep, at, out.add(count));
+                    #[cfg(target_arch = "x86_64")]
+                    let positions = if WIDE { wide_positions(sep, at, out.add(count)) } else { flatten::<10>(sep, at, out.add(count)) };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let positions = flatten::<10>(sep, at, out.add(count));
+                    count += positions;
                     lines += flatten::<2>(newline, at, ends.add(lines));
                     at += 64;
                 }

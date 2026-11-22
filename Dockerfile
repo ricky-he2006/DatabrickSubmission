@@ -2,7 +2,7 @@
 # The scorers build this natively on linux/amd64; on an Apple-silicon Mac the
 # builder stage cross-compiles, so `docker buildx build --platform linux/amd64`
 # stays fast there too.
-FROM --platform=$BUILDPLATFORM rust:1.85-slim-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.90-slim-bookworm AS builder
 ARG BUILDARCH
 ARG TARGETARCH
 WORKDIR /src
@@ -19,8 +19,8 @@ COPY native/ ./
 # x86-64-v3 (AVX2, BMI2): every scorer machine is Cascade Lake or newer.
 RUN target="$(head -n 1 /target-info)" && linker="$(tail -n 1 /target-info)" && \
     if [ "$BUILDARCH" = "$TARGETARCH" ]; then linker=cc; fi && \
-    case "$TARGETARCH" in amd64) cpu=x86-64-v3 ;; arm64) cpu=generic ;; esac && \
-    RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu" \
+    case "$TARGETARCH" in amd64) cpu=x86-64-v3; profile="-Cprofile-use=/src/profile/v5.profdata" ;; arm64) cpu=generic; profile= ;; esac && \
+    RUSTFLAGS="-C linker=$linker -C target-cpu=$cpu $profile" \
       cargo build --locked --release --target "$target" && \
     cp "target/$target/release/shopping-sessions" /shopping-sessions
 
