@@ -576,6 +576,30 @@ struct TailRow {
     pp: [u64; 4],
     _pad: u64,
 }
+// Each 12-bit window records its nearest three commas as byte distances
+// from the end. Two windows cover the last 24 bytes without a serial scan.
+const fn comma_windows(base: u32) -> [u32; 4096] {
+    let mut rows = [0; 4096];
+    let mut mask = 0usize;
+    while mask < rows.len() {
+        let mut shift = 0;
+        let mut distance = 1;
+        while distance <= 12 && shift < 24 {
+            if mask & (1 << (12 - distance)) != 0 {
+                rows[mask] |= (base + distance) << shift;
+                shift += 8;
+            }
+            distance += 1;
+        }
+        rows[mask] |= shift << 24;
+        mask += 1;
+    }
+    rows
+}
+
+static NEAR_COMMAS: [u32; 4096] = comma_windows(0);
+static FAR_COMMAS: [u32; 4096] = comma_windows(12);
+
 const TAIL_NO: u32 = u32::MAX;
 const TAIL_K: usize = 72;
 const TAIL_ROWS: usize = 63 * TAIL_K + 64;
@@ -1275,15 +1299,20 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let t = blsr(w1c);
         let c1 = tz2(t);
         let c2 = tz(blsr(t));
-        let tb = bzhi(wbc, m);
-        let z = _lzcnt_u64(tb);
-        let r6 = lea3::<-64>(m, z);
-        let t = tb.wrapping_shl(z as u32) << 1;
-        let r5 = _lzcnt_u64(t);
-        let t = t.wrapping_shl(r5 as u32) << 1;
-        let r4 = _lzcnt_u64(t);
-        let zr = z.wrapping_add(r5);
-        let i4 = lea3::<1>(zr, r4) ^ 63;
+        let window = wbc.wrapping_shl((64 - m) as u32);
+        let near = NEAR_COMMAS[(window >> 52) as usize];
+        let far = FAR_COMMAS[((window >> 40) & 4095) as usize];
+        let packed = near | (far << (near >> 24));
+        let last = packed & 255;
+        let middle = (packed >> 8) & 255;
+        let first = (packed >> 16) & 255;
+        if first == 0 || first as u64 > m {
+            return None;
+        }
+        let r6 = (last - 1) as u64;
+        let r5 = (middle - last - 1) as u64;
+        let r4 = (first - middle - 1) as u64;
+        let i4 = m + 1 - first as u64;
         let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
         if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) {
             return None;
