@@ -617,14 +617,17 @@ static LAYOUTS: [TailLayout; 4096] = tail_layouts();
 
 #[cold]
 #[inline(never)]
-fn uncommon_tail(tb: u64, m: u64) -> (u64, u64, u64) {
+fn uncommon_tail(tb: u64, m: u64) -> Option<(u64, u64, u64)> {
+    if m >= 64 || tb.count_ones() < 3 {
+        return None;
+    }
     let z = tb.leading_zeros() as u64;
     let r6 = m.wrapping_add(z).wrapping_sub(64);
     let remaining = tb.wrapping_shl(z as u32) << 1;
     let r5 = remaining.leading_zeros() as u64;
     let r4 = (remaining.wrapping_shl(r5 as u32) << 1).leading_zeros() as u64;
     let i4 = z.wrapping_add(r5).wrapping_add(r4).wrapping_add(1) ^ 63;
-    (i4, r4, r5 * TAIL_K as u64 + r6)
+    Some((i4, r4, r5 * TAIL_K as u64 + r6))
 }
 const TAIL_NO: u32 = u32::MAX;
 const TAIL_K: usize = 72;
@@ -1331,7 +1334,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let (i4, r4, tail_index) = if key != 0 && layout.mask == key {
             (m + 1 - layout.distance as u64, layout.kind_width as u64, layout.tail_index as u64)
         } else {
-            uncommon_tail(tb, m)
+            uncommon_tail(tb, m)?
         };
         let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
         if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) {
