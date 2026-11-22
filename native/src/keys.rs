@@ -59,8 +59,13 @@ static NAMES: LazyLock<[Mutex<Names>; SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| Mutex::new(Names::default())));
 
 #[inline]
+pub fn hash_bytes(value: &[u8]) -> u64 {
+    HASH.hash_one(value)
+}
+
+#[inline]
 fn intern(value: &[u8]) -> u64 {
-    let hash = HASH.hash_one(value);
+    let hash = hash_bytes(value);
     let shard = (hash >> 56) as usize;
     let i = NAMES[shard].lock().unwrap().insert(hash, value);
     INTERNED | ((i as u64) << 8) | shard as u64
