@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: 0d739bbc88136b9171617a7883ee340fd1920f7e
+      CANDIDATE: a63bf4fce0f7c3fcce05951a57ca1dcb7380664d
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,7 +40,7 @@ jobs:
         run: |
           git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 44351 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 15013 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
