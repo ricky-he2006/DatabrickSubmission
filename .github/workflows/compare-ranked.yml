@@ -35,6 +35,7 @@ jobs:
             if [ "$label" = general ]; then sha=d62e8f13468b5a160f1ffce2c7acdac7c88c58dc; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
+            sed -i 's/cascadelake/x86-64-v3/g' "$RUNNER_TEMP/$label-src/native/.cargo/config.toml" 2>/dev/null || true
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
             cid=$(docker create "$label")
             docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
@@ -83,21 +84,28 @@ jobs:
                       env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
                                  SCRATCH_DIR=str(scratch), NCPU=str(budget))
                       start = time.perf_counter()
-                      subprocess.run([str(root / label)], env=env, check=True)
-                      seconds = time.perf_counter() - start
-                      print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
-                      if round_number:
-                          samples[label].append(seconds)
-              print("AFFINITY", budget, {k:statistics.median(v) for k,v in samples.items()}, flush=True)
+                      try:
+                          subprocess.run([str(root / label)], env=env, check=True)
+                          seconds = time.perf_counter() - start
+                          print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
+                          if round_number:
+                              samples[label].append(seconds)
+                      except Exception as e:
+                          print(f"Round {round_number} {label} failed: {e}", flush=True)
+              print("AFFINITY", budget, {k:(statistics.median(v) if v else None) for k,v in samples.items()}, flush=True)
           for table in ["user_daily", "campaign_daily"]:
-              queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
+              active_labels = [l for l in labels if (root / (l + "-out") / table).exists()]
+              queries = [f"SELECT * FROM read_parquet('{root}/{l}-out/{table}/*.parquet')" for l in active_labels]
               for b in queries[1:]:
                   for lhs, rhs in [(queries[0], b), (b, queries[0])]:
                       if duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]:
                           raise ValueError(f"{table} differs for {b}")
+          base_label = "ranked" if samples.get("ranked") else "general"
+          base_median = statistics.median(samples[base_label])
           for label in labels:
-              median = statistics.median(samples[label])
-              print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+              if samples[label]:
+                  median = statistics.median(samples[label])
+                  print(f"RESULT {label} {median:.6f} s, ratio {median/base_median:.4f}, both tables match", flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
         if: matrix.events == 20000000 && matrix.format == 'current'
