@@ -103,7 +103,7 @@ fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
 
 thread_local! {
     static USERS: std::cell::RefCell<Vec<(u64, &'static [u8])>> =
-        std::cell::RefCell::new(vec![(0, &[]); 1 << 18]);
+        std::cell::RefCell::new(vec![(0, &[]); 1 << 15]);
 }
 
 /// Repeated long user names can be resolved by comparing their full bytes
@@ -115,7 +115,7 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
     }
     let value = unsafe { std::slice::from_raw_parts(p, n) };
     let hash = hash_bytes(value);
-    let slot = (hash >> 46) as usize & ((1 << 18) - 1);
+    let slot = (hash >> 49) as usize & ((1 << 15) - 1);
     USERS.with(|cache| {
         let mut cache = cache.borrow_mut();
         let entry = &mut cache[slot];

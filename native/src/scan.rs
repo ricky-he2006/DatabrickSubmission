@@ -213,7 +213,7 @@ unsafe fn flatten<const UNROLL: usize>(mut bits: u64, base: u32, out: *mut u32) 
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512vbmi2")]
+#[target_feature(enable = "avx512bw")]
 unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     let data = _mm512_loadu_si512(p.cast());
@@ -225,7 +225,7 @@ unsafe fn wide_classes(p: *const u8) -> (u64, u64, u64) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vbmi2")]
-unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+unsafe fn compress_positions(bits: u64, base: u32, out: *mut u32) -> usize {
     use std::arch::x86_64::*;
     const OFFSETS: [u8; 64] = {
         let mut a = [0; 64];
@@ -233,14 +233,20 @@ unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
         while i < 64 { a[i] = i as u8; i += 1; }
         a
     };
-    let n = bits.count_ones() as usize;
-    if n > 16 {
-        return flatten::<10>(bits, base, out);
-    }
     let packed = _mm512_maskz_compress_epi8(bits, _mm512_loadu_si512(OFFSETS.as_ptr().cast()));
     let positions = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(packed));
     _mm512_storeu_si512(out.cast(), _mm512_add_epi32(_mm512_set1_epi32(base as i32), positions));
-    n
+    bits.count_ones() as usize
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn wide_positions(bits: u64, base: u32, out: *mut u32) -> usize {
+    let n = bits.count_ones() as usize;
+    if n <= 16 && std::arch::is_x86_feature_detected!("avx512vbmi2") {
+        return compress_positions(bits, base, out);
+    }
+    flatten::<10>(bits, base, out)
 }
 
 /// Chunks of 64 bytes indexed before their lines are handed out.
@@ -464,14 +470,14 @@ impl Block {
     #[inline(always)]
     pub fn raw_lines<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("avx512vbmi2") && std::arch::is_x86_feature_detected!("avx512bw") {
+        if std::arch::is_x86_feature_detected!("avx512bw") {
             return unsafe { self.raw_wide(visit) };
         }
         self.raw_indexed::<N, false>(visit)
     }
 
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512bw,avx512vbmi2")]
+    #[target_feature(enable = "avx512bw")]
     unsafe fn raw_wide<const N: usize>(&self, visit: impl FnMut(*const u8, u32, &[u32; N])) {
         self.raw_indexed::<N, true>(visit)
     }
