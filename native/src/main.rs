@@ -537,5 +537,5 @@ fn main() {
             for (kb, n) in v.iter().rev().take(12) { eprintln!("[dbg] rss {kb} kB {n}"); }
         }
     }
-    unsafe { sys::_exit(0) }
+    std::process::exit(0)
 }

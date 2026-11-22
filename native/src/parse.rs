@@ -1878,7 +1878,8 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
         }
         let allowed: Vec<usize> = (0..1024).filter(|&c| m[c / 64] >> (c % 64) & 1 != 0).collect();
         let mut seen = vec![false; 1024];
-        let mut out = Vec::new();
+        let mut cores = Vec::new();
+        let mut siblings = Vec::new();
         for &c in &allowed {
             if seen[c] {
                 continue;
@@ -1899,14 +1900,19 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
             if !has_c {
                 grp = vec![c];
             }
+            // Fill one hardware thread per physical core before using SMT
+            // siblings. A CPU quota can be smaller than the affinity mask.
+            cores.push(c);
+            seen[c] = true;
             for x in grp {
                 if x < 1024 && !seen[x] && m[x / 64] >> (x % 64) & 1 != 0 {
                     seen[x] = true;
-                    out.push(x);
+                    siblings.push(x);
                 }
             }
         }
-        out
+        cores.extend(siblings);
+        cores
     })
 }
 
@@ -2169,7 +2175,7 @@ pub fn stage1(g: &G, tid: usize) {
     if !rb.is_null() {
         unsafe { madvise(rb.sub(4096), rd + 8192, MADV_DONTNEED) };
     }
-    if pinned && (d.pin == 1 || tid == 0) {
+    if pinned && d.pin == 1 {
         unsafe { syscall(203, 0i32, 128usize, saved.as_ptr()) };
     }
     #[cfg(feature = "pmu")]
