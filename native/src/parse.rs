@@ -93,6 +93,14 @@ impl Part {
     #[inline(always)]
     pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
         use std::arch::x86_64::*;
+        // Bring valid destination lines into the private cache before the
+        // batch performs its scattered stores. Masked lanes have no address.
+        let mut pending = m;
+        while pending != 0 {
+            let i = pending.trailing_zeros() as usize;
+            _mm_prefetch::<_MM_HINT_T0>(*lp.add(i) as *const i8);
+            pending &= pending - 1;
+        }
         let fill = self.fill.as_mut_ptr();
         let full = self.pend.as_mut_ptr() as *mut u64;
         let mut fp = full;
