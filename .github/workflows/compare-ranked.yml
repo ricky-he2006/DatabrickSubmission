@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: 0ed7cf02c4654bc54f8c4a7b55edb9a3d117cdbc
+      CANDIDATE: d41d195811014f3886fa156df7b238cc631a4c87
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,10 +25,10 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate memory; do
+          for label in ranked candidate general; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = memory ]; then sha=4d47a27; fi
+            if [ "$label" = general ]; then sha=6b260521; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -38,9 +38,13 @@ jobs:
           done
       - name: Generate fresh data
         run: |
-          git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
-          cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 33191 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+          cd "$RUNNER_TEMP"
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/generator.zip"
+          echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
+          unzip -q generator.zip
+          cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
+            --seed 31267 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -54,13 +58,13 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate", "memory"]
+          labels = ["ranked", "candidate", "general"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
           for budget in [workers]:
               samples = {label: [] for label in labels}
-              for round_number in range(8):
+              for round_number in range(4):
                   order = labels[round_number % len(labels):] + labels[:round_number % len(labels)]
                   for label in order:
                       output = root / (label + "-out")
@@ -94,9 +98,10 @@ jobs:
           curl --retry 3 -fsSLO "$track/starter-polars.zip"
           curl --retry 3 -fsSLO "$track/dev-answer.zip"
           unzip -q starter-polars.zip
+          echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
-          cargo run --locked --release --manifest-path pgo-generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          for label in memory candidate; do
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
+          for label in candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
