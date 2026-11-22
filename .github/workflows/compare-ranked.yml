@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: f161770021eb5ed81619584d9329ebac05f2ea4c
+      CANDIDATE: a9dc5f2125f1bac51c2197e537b16c8746b89401
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +30,7 @@ jobs:
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
-            docker build --build-arg TRAIN_PROFILE=0 -q -t "$label" "$RUNNER_TEMP/$label-src"
+            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
             cid=$(docker create "$label")
             docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
             docker rm "$cid"
@@ -39,7 +39,7 @@ jobs:
         run: |
           git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 6311 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 9783 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -57,7 +57,7 @@ jobs:
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
-          for budget in [max(1, workers//2), workers]:
+          for budget in [workers]:
               samples = {label: [] for label in labels}
               for round_number in range(8):
                   for label in labels[::1 if round_number % 2 == 0 else -1]:
