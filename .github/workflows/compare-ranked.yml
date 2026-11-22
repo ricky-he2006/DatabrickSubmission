@@ -25,9 +25,11 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate; do
+          for label in ranked candidate lookup memory; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = lookup ]; then sha=8853c23; fi
+            if [ "$label" = memory ]; then sha=4d47a27; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -39,7 +41,7 @@ jobs:
         run: |
           git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 9783 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 9177 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -53,14 +55,15 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "lookup", "memory"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
           for budget in [workers]:
               samples = {label: [] for label in labels}
               for round_number in range(8):
-                  for label in labels[::1 if round_number % 2 == 0 else -1]:
+                  order = labels[round_number % 4:] + labels[:round_number % 4]
+                  for label in order:
                       output = root / (label + "-out")
                       if output.exists():
                           shutil.rmtree(output)
@@ -76,15 +79,10 @@ jobs:
               print("AFFINITY", budget, {k:statistics.median(v) for k,v in samples.items()}, flush=True)
           for table in ["user_daily", "campaign_daily"]:
               queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
-              a, b = queries
-              for lhs, rhs in [(a, b), (b, a)]:
-                  count = duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]
-                  if count:
-                      raise ValueError(f"{table} differs by {count} rows in one direction")
-          ranked, candidate = (statistics.median(samples[label]) for label in labels)
-          summary = (f"{os.environ['EVENTS']} events, {workers} workers, seven timed runs. "
-                     f"Ranked {ranked:.6f} s. Candidate {candidate:.6f} s. "
-                     f"Candidate/ranked {candidate / ranked:.4f}. Both tables match.")
-          print(summary)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
-              print(summary, file=out)
+              for b in queries[1:]:
+                  for lhs, rhs in [(queries[0], b), (b, queries[0])]:
+                      if duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]:
+                          raise ValueError(f"{table} differs for {b}")
+          for label in labels:
+              median = statistics.median(samples[label])
+              print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
