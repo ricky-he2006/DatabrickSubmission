@@ -2082,6 +2082,7 @@ pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 9);
     let rd = d.rd;
+    let populate_input = std::env::var_os("XL_POPULATE_INPUT").is_some();
     #[allow(static_mut_refs)]
     let fds: &[i32] = unsafe { &FDS };
     let use_rd = rd > 0 && fds.len() == g.files.len() && unsafe { SKIP } & 512 == 0;
@@ -2131,6 +2132,12 @@ pub fn stage1(g: &G, tid: usize) {
             continue;
         }
         let data = unsafe { std::slice::from_raw_parts(g.region.add(f.off), f.len) };
+        if populate_input {
+            // Populate only this worker's file range, including the page
+            // containing the first row. An unsupported hint is harmless.
+            let start = (c.a - 1) & !4095;
+            unsafe { madvise(g.region.add(f.off + start), c.b - start, 22) };
+        }
         let s = if c.a == f.hdr { c.a } else { next_line_start(data, c.a - 1) };
         let e = if c.b >= f.len { f.len } else { next_line_start(data, c.b - 1) };
         if s >= e {

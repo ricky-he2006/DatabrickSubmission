@@ -16,7 +16,13 @@ macro_rules! kernel {
         impl Kernel for $ty {
             const NAME: &'static str = $name;
             fn events<S: EventSink>(buf: &[u8], sink: &mut S) {
-                unsafe { run_events::<S, $mode>(buf, sink) }
+                unsafe {
+                    if $mode == PIPE && indexed_rows() && buf.len() >= 4096 {
+                        run_indexed_events(buf, sink);
+                    } else {
+                        run_events::<S, $mode>(buf, sink);
+                    }
+                }
                 sink.ev_flush();
             }
             fn clicks<S: ClickSink>(buf: &[u8], sink: &mut S) {
@@ -1807,6 +1813,62 @@ macro_rules! runner {
         }
     };
 }
+fn indexed_rows() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("XL_INDEX_ROWS").is_some())
+}
+
+/// Discover line ends in independent 64-byte loads. The decoder can then
+/// locate the next row without waiting on the preceding row's newline mask.
+unsafe fn run_indexed_events<S: EventSink>(buf: &[u8], sink: &mut S) {
+    unsafe {
+        let base = buf.as_ptr();
+        let b = sink.ev();
+        let cx = Cx { base, end: base.add(buf.len()), b, cache: (*b).scratch.as_mut_ptr().cast(), sink };
+        let mut w = (*b).ts.as_mut_ptr().add((*b).n);
+        let comma = _mm512_set1_epi8(b',' as i8);
+        let newline = _mm512_set1_epi8(b'\n' as i8);
+        let mut row = 0;
+        let mut scan = 0;
+        while scan + 512 + 128 <= buf.len() {
+            let mut masks = [0u64; 8];
+            for (lane, mask) in masks.iter_mut().enumerate() {
+                let data = _mm512_loadu_si512(base.add(scan + lane * 64).cast());
+                *mask = _mm512_cmpeq_epi8_mask(data, newline);
+            }
+            for (lane, mut mask) in masks.into_iter().enumerate() {
+                while mask != 0 {
+                    let end = scan + lane * 64 + mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let len = end - row;
+                    if (FB..FB + 64).contains(&len) {
+                        let p = base.add(row);
+                        let front = _mm512_loadu_si512(p.cast());
+                        let back = _mm512_loadu_si512(p.add(FB).cast());
+                        let k = EvMasks {
+                            w1c: _mm512_cmpeq_epi8_mask(front, comma),
+                            wbc: _mm512_cmpeq_epi8_mask(back, comma),
+                            wn: 1 << (len - FB),
+                        };
+                        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PFD).cast());
+                        ev_fast::<S, false>(&cx, p, k, base.add(end + 1), &mut w);
+                    } else {
+                        (*b).n = w.offset_from((*b).ts.as_ptr()) as usize;
+                        slow::event(buf, row, end, &mut *cx.sink);
+                        w = (*b).ts.as_mut_ptr().add((*b).n);
+                    }
+                    row = end + 1;
+                }
+            }
+            scan += 512;
+        }
+        (*b).n = w.offset_from((*b).ts.as_ptr()) as usize;
+        while row < buf.len() {
+            row = scan_event(buf, row, &mut *cx.sink);
+        }
+    }
+}
+
 runner!(run_events, EventSink, ev, ev_fast, ev_masks, OB, scan_event, pipe_stages, ev_s, ev_d, ev_cold, UNROLL_EV);
 
 
