@@ -127,15 +127,21 @@ impl<T: Copy> Buckets<T> {
             Some(base) => base,
             None => {
                 if self.carved % SLAB == 0 {
-                    let slab: Vec<u8> = Vec::with_capacity((SLAB + 1) * CHUNK_BYTES);
-                    huge(slab.as_ptr(), (SLAB + 1) * CHUNK_BYTES);
+                    let bytes = (SLAB + 1) * CHUNK_BYTES;
+                    let slab: Vec<u8> = Vec::with_capacity(bytes);
+                    huge(slab.as_ptr(), bytes);
                     self.slabs.push(slab);
                 }
                 let slab = self.slabs.last().unwrap().as_ptr() as usize;
                 let first = (slab + CHUNK_BYTES - 1) & !(CHUNK_BYTES - 1);
                 let base = (first + (self.carved % SLAB) * CHUNK_BYTES) as *mut T;
+                // Commit only the next 2 MiB of chunks. Click and dedup
+                // workers often use a small fraction of their last slab.
+                const BATCH: usize = (1 << 21) / CHUNK_BYTES;
+                if self.carved % BATCH == 0 && POPULATE.load(Ordering::Relaxed) != 0 {
+                    fault_slab(base as *const u8, BATCH * CHUNK_BYTES);
+                }
                 self.carved += 1;
-                populate(base as *const u8, CHUNK_BYTES);
                 base
             }
         };
@@ -180,8 +186,8 @@ impl<T: Copy> Buckets<T> {
 struct Parsed {
     id: u64,
     user: u64,
-    /// Milliseconds after `window_start - 10 days`, clamped.
-    ingest: u32,
+    /// Full UTC ingestion time, including copies ingested before the window.
+    ingest: i64,
     /// Milliseconds after `window_start`, or `DEAD`.
     ts: u32,
     /// 0, or for a purchase its category in the top 8 bits and price below.
@@ -331,28 +337,23 @@ impl Links {
             }
             let a = find(&mut parent, a);
             let b = find(&mut parent, b);
-            if a < b {
-                parent[b as usize] = a;
-            } else {
-                parent[a as usize] = b;
+            if a != b {
+                let root = a.min(b) as usize;
+                let child = a.max(b) as usize;
+                parent[child] = root as u32;
+                if keys::compare(names[child], names[root]) == Order::Less {
+                    names[root] = names[child];
+                }
             }
         }
-        // Each person's name: the byte-wise smallest ID under their root.
-        let mut smallest = names.clone();
-        for (id, &name) in names.iter().enumerate() {
-            let root = find(&mut parent, id as u32) as usize;
-            if keys::compare(name, smallest[root]) == Order::Less {
-                smallest[root] = name;
-            }
+        // Parents always have smaller indices. In ascending order their
+        // canonical names have already been resolved, even along long chains.
+        for (id, &up) in parent.iter().enumerate() {
+            names[id] = names[up as usize];
         }
-        for at in 0..slots.len() {
-            if at + 16 < slots.len() && slots[at + 16][0] != 0 {
-                prefetch(&parent[slots[at + 16][1] as usize]);
-            }
-            let entry = &mut slots[at];
+        for entry in &mut slots {
             if entry[0] != 0 {
-                // After the pass above every ID is at most one step from its root.
-                entry[1] = smallest[find(&mut parent, entry[1] as u32) as usize];
+                entry[1] = names[entry[1] as usize];
             }
         }
         Self {
@@ -415,25 +416,24 @@ pub static HUGE: AtomicUsize = AtomicUsize::new(1);
 static LINKS_MICROS: AtomicUsize = AtomicUsize::new(0);
 pub static POPULATE: AtomicUsize = AtomicUsize::new(0);
 
-/// With `POPULATE` on: when `count` values at `start` begin a new 2 MB stretch,
-/// fault the whole stretch in with one call (MADV_POPULATE_WRITE).
-#[inline(always)]
-fn populate<T>(start: *const T, count: usize) {
+/// Faults every page under `bytes` at `start` before the first store there.
+fn fault_slab(start: *const u8, bytes: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
         unsafe extern "C" {
             fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
         }
-        const STRETCH: usize = 1 << 21;
-        let first = start as usize;
-        let last = first + count * std::mem::size_of::<T>() - 1;
-        if POPULATE.load(Ordering::Relaxed) != 0 && (first / STRETCH != last / STRETCH || first % STRETCH < 8192) {
-            let from = last & !(STRETCH - 1);
-            madvise(from as *mut _, STRETCH, 23);
+        let page = 4096usize;
+        let start = start as usize;
+        let from = (start + page - 1) & !(page - 1);
+        let to = (start + bytes) & !(page - 1);
+        if to > from {
+            // MADV_POPULATE_WRITE. Older kernels fall back to normal faults.
+            madvise(from as *mut _, to - from, 23);
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (start, count);
+    let _ = (start, bytes);
 }
 
 /// Drops the pages under `count` values at `start` (MADV_DONTNEED).
@@ -588,7 +588,6 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
     let window_end = shared.window_end;
-    let ingest_base = window_start - 10 * DAY;
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -598,7 +597,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         }
         let id = id ^ copy;
         let (p, n) = field(3);
-        let ingest = ts::parse(p, n, dates);
+        let ingest = ts::ingest(p, n, dates);
         if ingest == ts::BAD {
             return;
         }
@@ -635,7 +634,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest: (ingest - ingest_base).clamp(0, u32::MAX as i64) as u32,
+            ingest,
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
@@ -979,13 +978,14 @@ impl Sessions<'_> {
 fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
     scratch.clear();
     scratch.resize(values.len(), 0);
-    let mut counts = [0u32; 2048];
+    let mut histograms = [[0u32; 2048]; 3];
+    for &value in values.iter() {
+        histograms[0][(value >> 32) as usize & 2047] += 1;
+        histograms[1][(value >> 43) as usize & 2047] += 1;
+        histograms[2][(value >> 54) as usize] += 1;
+    }
     let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
-    for shift in [32, 43, 54] {
-        counts.fill(0);
-        for &value in from.iter() {
-            counts[(value >> shift) as usize & 2047] += 1;
-        }
+    for (shift, counts) in [32, 43, 54].into_iter().zip(&mut histograms) {
         let mut sum = 0;
         for count in counts.iter_mut() {
             let here = *count;
@@ -1243,7 +1243,9 @@ fn main() -> io::Result<()> {
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
-    let map = tune("SS_MAP", 1) != 0;
+    // Reuse worker read buffers on Linux to avoid establishing mappings
+    // for the entire input. SS_MAP=1 selects the mapped scanner.
+    let map = tune("SS_MAP", if cfg!(target_os = "linux") { 0 } else { 1 }) != 0;
     let give_back = tune("SS_RELEASE", 1) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
@@ -1342,6 +1344,8 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let input_bytes = files.iter().map(|file| file.size).sum::<u64>().saturating_mul(copies);
+    let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let shared = Shared {
@@ -1357,8 +1361,8 @@ fn main() -> io::Result<()> {
         work,
         next: AtomicUsize::new(0),
         link_files: csv_files(&data.join("links"))?,
-        id_bits: tune("SS_ID_BITS", ID_BITS as u64).clamp(1, 16) as u32,
-        person_bits: tune("SS_PERSON_BITS", PERSON_BITS as u64).clamp(1, 16) as u32,
+        id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
+        person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
         links: OnceLock::new(),
         output,
@@ -1401,7 +1405,7 @@ fn main() -> io::Result<()> {
             .map(|buckets| buckets.chunks[part as usize] as u64)
             .sum::<u64>()
     };
-    order.sort_by_key(|&part| std::cmp::Reverse(weight(part)));
+    order.sort_by_cached_key(|&part| std::cmp::Reverse(weight(part)));
     let order = &order;
     let next = AtomicUsize::new(0);
     let results: Vec<(Vec<Totals>, bool)> = std::thread::scope(|scope| {

@@ -24,6 +24,8 @@ unsafe extern "C" {
     ) -> *mut std::ffi::c_void;
     #[cfg(target_os = "linux")]
     fn madvise(address: *mut std::ffi::c_void, length: usize, advice: i32) -> i32;
+    #[cfg(target_os = "linux")]
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
 }
 
 /// An input file, mapped when it can be.
@@ -41,6 +43,11 @@ impl Source {
         use std::os::fd::AsRawFd;
         let file = File::open(path)?;
         let size = file.metadata()?.len();
+        // Workers read consecutive regions from each file.
+        #[cfg(target_os = "linux")]
+        if size > 0 {
+            unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, 2) };
+        }
         let mut mapped = std::ptr::null();
         if map && size > 0 {
             let address = unsafe { mmap(std::ptr::null_mut(), size as usize, 1, 2, file.as_raw_fd(), 0) };
@@ -315,6 +322,7 @@ impl Block {
     fn reserve(&mut self, data: usize) {
         let need = PAD + data + 1 + 4 * PAD;
         if self.buf.len() < need {
+            // load() may already have read a prefix on a previous iteration.
             self.buf.resize(need, 0);
         }
     }
@@ -658,6 +666,16 @@ mod tests {
         let fast = collect::<N>(&block, false);
         let slow = collect::<N>(&block, true);
         assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&data));
+    }
+
+    #[test]
+    fn growing_a_block_preserves_the_partial_row() {
+        let mut block = Block::new();
+        block.reserve(EXTRA);
+        block.buf[PAD..PAD + 4].copy_from_slice(b"row,");
+        let previous_capacity = block.buf.capacity();
+        block.reserve(previous_capacity + EXTRA);
+        assert_eq!(&block.buf[PAD..PAD + 4], b"row,");
     }
 
     #[test]
