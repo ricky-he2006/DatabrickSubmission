@@ -798,7 +798,9 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
     let (ahead, person_bits) = (shared.ahead, shared.person_bits);
     let mut chunks: Vec<(*mut Parsed, usize)> = Vec::new();
     let mut owners = Vec::new();
-    let mut table: Vec<u32> = Vec::new();
+    // High half is a hash tag, low half locates the winning row. A tag mismatch
+    // avoids fetching the row from its originating chunk.
+    let mut table: Vec<u64> = Vec::new();
     loop {
         let part = next.fetch_add(1, Ordering::Relaxed);
         if part >= 1 << shared.id_bits {
@@ -817,7 +819,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
         let capacity = (total * 2).next_power_of_two();
         let mask = capacity - 1;
         table.clear();
-        table.resize(capacity, NONE);
+        table.resize(capacity, u64::MAX);
         unsafe {
             for (index, &(base, count)) in chunks.iter().enumerate() {
                 for offset in 0..count {
@@ -826,13 +828,21 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                     let entry = ((index << OFFSET_BITS) | offset) as u32;
                     let long = shared.defer_long_events && id & LONG_EVENT == LONG_EVENT;
                     let hash_key = if long { (id >> 32) & EVENT_FINGERPRINT } else { id };
-                    let mut slot = (hash_key.wrapping_mul(MIX) >> 24) as usize & mask;
+                    let hash = hash_key.wrapping_mul(MIX);
+                    let tag = (hash.rotate_left(19) as u32 as u64) << 32;
+                    let tagged_entry = tag | u64::from(entry);
+                    let mut slot = (hash >> 24) as usize & mask;
                     loop {
                         let seen = *table.get_unchecked(slot);
-                        if seen == NONE {
-                            *table.get_unchecked_mut(slot) = entry;
+                        if seen == u64::MAX {
+                            *table.get_unchecked_mut(slot) = tagged_entry;
                             break;
                         }
+                        if seen & 0xffff_ffff_0000_0000 != tag {
+                            slot = (slot + 1) & mask;
+                            continue;
+                        }
+                        let seen = seen as u32;
                         let other = chunks
                             .get_unchecked((seen >> OFFSET_BITS) as usize)
                             .0
@@ -850,7 +860,7 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                         if equal {
                             if (*record).ingest < (*other).ingest {
                                 (*other).ts = DEAD;
-                                *table.get_unchecked_mut(slot) = entry;
+                                *table.get_unchecked_mut(slot) = tagged_entry;
                             } else {
                                 (*record).ts = DEAD;
                             }
