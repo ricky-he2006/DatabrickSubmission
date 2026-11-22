@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: a36b4f70bdd4b6f553e54f1f70b335417fe0f120
+      CANDIDATE: 0d739bbc88136b9171617a7883ee340fd1920f7e
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,9 +25,10 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate; do
+          for label in ranked candidate memory; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
+            if [ "$label" = memory ]; then sha=4d47a27; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -39,7 +40,7 @@ jobs:
         run: |
           git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 11003 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 44351 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -53,14 +54,15 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "memory"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
           for budget in [workers]:
               samples = {label: [] for label in labels}
               for round_number in range(8):
-                  for label in labels[::1 if round_number % 2 == 0 else -1]:
+                  order = labels[round_number % len(labels):] + labels[:round_number % len(labels)]
+                  for label in order:
                       output = root / (label + "-out")
                       if output.exists():
                           shutil.rmtree(output)
@@ -76,15 +78,33 @@ jobs:
               print("AFFINITY", budget, {k:statistics.median(v) for k,v in samples.items()}, flush=True)
           for table in ["user_daily", "campaign_daily"]:
               queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
-              a, b = queries
-              for lhs, rhs in [(a, b), (b, a)]:
-                  count = duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]
-                  if count:
-                      raise ValueError(f"{table} differs by {count} rows in one direction")
-          ranked, candidate = (statistics.median(samples[label]) for label in labels)
-          summary = (f"{os.environ['EVENTS']} events, {workers} workers, seven timed runs. "
-                     f"Ranked {ranked:.6f} s. Candidate {candidate:.6f} s. "
-                     f"Candidate/ranked {candidate / ranked:.4f}. Both tables match.")
-          print(summary)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
-              print(summary, file=out)
+              for b in queries[1:]:
+                  for lhs, rhs in [(queries[0], b), (b, queries[0])]:
+                      if duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]:
+                          raise ValueError(f"{table} differs for {b}")
+          for label in labels:
+              median = statistics.median(samples[label])
+              print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+
+      - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
+        if: matrix.events == 20000000
+        run: |
+          cd "$RUNNER_TEMP"
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/starter-polars.zip"
+          curl --retry 3 -fsSLO "$track/dev-answer.zip"
+          unzip -q starter-polars.zip
+          unzip -q dev-answer.zip
+          cargo run --locked --release --manifest-path pgo-generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
+          for label in memory candidate; do
+            for fixture in starter-polars/fixtures/*; do
+              rm -rf verify-out
+              mkdir -p verify-out
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label"
+              python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
+            done
+            rm -rf verify-out
+            mkdir -p verify-out
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label"
+            python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
+          done
