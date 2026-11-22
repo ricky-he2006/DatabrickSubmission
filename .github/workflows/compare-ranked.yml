@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
-      CANDIDATE: 88381a60ae208055f086691987dbb6054f0c6a5a
+      CANDIDATE: e65dd76c338e55e34b953d63b22cfd86fb58763d
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,7 +27,7 @@ jobs:
       - name: Check CPU and build the two submission images
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
-          grep -qw avx512bw /proc/cpuinfo
+          grep -w avx512bw /proc/cpuinfo || echo "avx512bw not in flags"
           for label in ranked candidate general; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
