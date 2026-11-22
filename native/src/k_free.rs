@@ -1278,7 +1278,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         // The shortest supported ingest timestamp occupies 20 bytes. Look for
         // its delimiter and the two trailing delimiters in forward order.
         let first = c2.wrapping_add(21).wrapping_sub(FB as u64);
-        if first >= 64 || m > 63 || (TAIL && pb.wrapping_add(m as usize) >= cx.end) {
+        if c2 > 62 || first >= 64 || m > 63 || (TAIL && pb.wrapping_add(m as usize) >= cx.end) {
             return None;
         }
         let tail = wbc >> first;
