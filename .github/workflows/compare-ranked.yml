@@ -6,16 +6,16 @@ permissions:
   contents: read
 jobs:
   compare:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        events: [20000000, 60000000]
+        events: [20000000]
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: a326112ff26b0381fa4104e9fcdc27816f88bec6
+      CANDIDATE: 754567a10bb9204b960bd85d36dad412808fb495
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +30,7 @@ jobs:
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
-            docker build --progress=plain -t "$label" "$RUNNER_TEMP/$label-src"
+            docker build --build-arg TRAIN_PROFILE=0 --progress=plain -t "$label" "$RUNNER_TEMP/$label-src"
             cid=$(docker create "$label")
             docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
             docker rm "$cid"
@@ -55,31 +55,35 @@ jobs:
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
-          for round_number in range(8):
-              for label in labels[::1 if round_number % 2 == 0 else -1]:
+          import random
+          cases = {"ranked": {}, "candidate": {}, "indexed": {"XL_INDEX_ROWS":"1"},
+                   "populate":{"XL_POPULATE_INPUT":"1"}, "click_index":{"XL_CKIX":"1"},
+                   "click_parts":{"XL_CKIX":"2"}, "teardown":{"XL_ENDREL":"2"},
+                   "long_prefetch":{"XL_PF":"1","XL_ENDREL":"2"}}
+          samples = {label:[] for label in cases}
+          rng=random.Random(43)
+          for round_number in range(6):
+              order=list(cases)
+              rng.shuffle(order)
+              for label in order:
                   output = root / (label + "-out")
                   if output.exists():
                       shutil.rmtree(output)
                   output.mkdir()
                   env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
-                             SCRATCH_DIR=str(scratch), NCPU=str(workers))
+                             SCRATCH_DIR=str(scratch), NCPU=str(workers), **cases[label])
                   start = time.perf_counter()
-                  subprocess.run([str(root / label)], env=env, check=True)
+                  subprocess.run([str(root / ("ranked" if label=="ranked" else "candidate"))], env=env, check=True)
                   seconds = time.perf_counter() - start
-                  print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
                   if round_number:
                       samples[label].append(seconds)
+          for name, values in samples.items():
+              print("RESULT",name,statistics.median(values),values,flush=True)
           for table in ["user_daily", "campaign_daily"]:
-              queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
-              a, b = queries
-              for lhs, rhs in [(a, b), (b, a)]:
-                  count = duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]
-                  if count:
-                      raise ValueError(f"{table} differs by {count} rows in one direction")
-          ranked, candidate = (statistics.median(samples[label]) for label in labels)
-          summary = (f"{os.environ['EVENTS']} events, {workers} workers, seven timed runs. "
-                     f"Ranked {ranked:.6f} s. Candidate {candidate:.6f} s. "
-                     f"Candidate/ranked {candidate / ranked:.4f}. Both tables match.")
-          print(summary)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
-              print(summary, file=out)
+              a=f"SELECT * FROM read_parquet('{root}/ranked-out/{table}/*.parquet')"
+              for label in cases:
+                  if label=="ranked": continue
+                  b=f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')"
+                  for lhs,rhs in [(a,b),(b,a)]:
+                      if duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]:
+                          raise ValueError(f"{label}: different {table}")
