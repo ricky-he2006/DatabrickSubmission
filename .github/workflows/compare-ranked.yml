@@ -26,6 +26,7 @@ jobs:
           persist-credentials: false
       - name: Check CPU and build the two submission images
         run: |
+          git fetch --all
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -w avx512bw /proc/cpuinfo || echo "avx512bw not in flags"
           for label in ranked candidate general; do
