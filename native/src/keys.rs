@@ -65,10 +65,40 @@ pub fn hash_bytes(value: &[u8]) -> u64 {
 
 #[inline]
 fn intern(value: &[u8]) -> u64 {
+    intern_name(value).0
+}
+
+fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
     let hash = hash_bytes(value);
     let shard = (hash >> 56) as usize;
-    let i = NAMES[shard].lock().unwrap().insert(hash, value);
-    INTERNED | ((i as u64) << 8) | shard as u64
+    let mut table = NAMES[shard].lock().unwrap();
+    let i = table.insert(hash, value);
+    (INTERNED | ((i as u64) << 8) | shard as u64, table.entries[i].1)
+}
+
+thread_local! {
+    static USERS: std::cell::RefCell<Vec<(u64, &'static [u8])>> =
+        std::cell::RefCell::new(vec![(0, &[]); 1 << 15]);
+}
+
+/// Repeated long user names can be resolved by comparing their full bytes
+/// with a worker-local entry. The shared interner assigns the canonical key.
+#[inline(always)]
+pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
+    if n != 33 {
+        return unsafe { pack(p, n) };
+    }
+    let value = unsafe { std::slice::from_raw_parts(p, n) };
+    let prefix = u64::from_le_bytes(value[1..9].try_into().unwrap());
+    let slot = (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 49) as usize;
+    USERS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = &mut cache[slot];
+        if entry.1 != value {
+            *entry = intern_name(value);
+        }
+        entry.0
+    })
 }
 
 fn name(key: u64) -> &'static [u8] {
@@ -154,18 +184,19 @@ pub fn unpack(key: u64, out: &mut Vec<u8>) {
     }
 }
 
+pub fn bytes(key: u64, packed: &mut [u8; 9]) -> &[u8] {
+    if key & INTERNED != 0 {
+        return name(key);
+    }
+    for (i, byte) in packed.iter_mut().enumerate() {
+        *byte = ((key >> (56 - i * 7)) & 127) as u8;
+    }
+    &packed[..packed.iter().position(|&b| b == 0).unwrap_or(9)]
+}
+
 #[cold]
 #[inline(never)]
 fn compare_slow(a: u64, b: u64) -> Ordering {
-    fn bytes(key: u64, packed: &mut [u8; 9]) -> &[u8] {
-        if key & INTERNED != 0 {
-            return name(key);
-        }
-        for (i, byte) in packed.iter_mut().enumerate() {
-            *byte = ((key >> (56 - i * 7)) & 127) as u8;
-        }
-        &packed[..packed.iter().position(|&b| b == 0).unwrap_or(9)]
-    }
     bytes(a, &mut [0; 9]).cmp(bytes(b, &mut [0; 9]))
 }
 

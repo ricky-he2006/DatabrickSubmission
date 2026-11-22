@@ -564,9 +564,9 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
             block.load(&source, start, end)?;
             block.raw_lines::<2>(|buf, start, seps| unsafe {
                 let (p, n) = scan::field(buf, start, seps, 0);
-                let a = keys::pack(p, n);
+                let a = keys::pack_user(p, n);
                 let (p, n) = scan::field(buf, start, seps, 1);
-                let b = keys::pack(p, n);
+                let b = keys::pack_user(p, n);
                 if a != 0 && b != 0 && a != b {
                     pairs.push((a, b));
                 }
@@ -620,7 +620,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             return;
         }
         let (p, n) = field(1);
-        let user = keys::pack(p, n);
+        let user = keys::pack_user(p, n);
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
@@ -660,13 +660,33 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
     });
 }
 
+struct ClickSource {
+    buckets: Buckets<Click>,
+    names: Vec<[u8; 33]>,
+    worker: usize,
+}
+
+fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp::Ordering {
+    if !local || (a & LONG_EVENT != LONG_EVENT && b & LONG_EVENT != LONG_EVENT) {
+        return keys::compare(a, b);
+    }
+    fn name<'a>(key: u64, sources: &'a [ClickSource], scratch: &'a mut [u8; 9]) -> &'a [u8] {
+        if key & LONG_EVENT == LONG_EVENT {
+            &sources[((key & !LONG_EVENT) >> 32) as usize].names[key as u32 as usize]
+        } else {
+            keys::bytes(key, scratch)
+        }
+    }
+    name(a, sources, &mut [0; 9]).cmp(name(b, sources, &mut [0; 9]))
+}
+
 fn parse_clicks(
     shared: &Shared,
     block: &Block,
     copy: u64,
     dates: &mut ts::Dates,
     pending: &mut Vec<RawClick>,
-    out: &mut Buckets<Click>,
+    out: &mut ClickSource,
 ) {
     let earliest = shared.window_start - WEEK;
     let window_end = shared.window_end;
@@ -674,9 +694,15 @@ fn parse_clicks(
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
-        let id = keys::pack(p, n);
+        let id = if n == 33 && shared.defer_long_events {
+            let index = u32::try_from(out.names.len()).expect("too many long click IDs in one worker");
+            out.names.push(*p.cast::<[u8; 33]>());
+            LONG_EVENT | (out.worker as u64) << 32 | index as u64
+        } else {
+            keys::pack(p, n)
+        };
         let (p, n) = field(1);
-        let user = keys::pack(p, n);
+        let user = keys::pack_user(p, n);
         if id == 0 || user == 0 {
             return;
         }
@@ -707,7 +733,7 @@ fn parse_clicks(
         }
         let click = pending[at];
         let person = links.person(click.user);
-        out.push(
+        out.buckets.push(
             person_part(person, shared.person_bits),
             Click {
                 person,
@@ -719,9 +745,9 @@ fn parse_clicks(
     }
 }
 
-fn parse_worker(shared: &Shared, first: bool) -> io::Result<(EventSource, Buckets<Click>)> {
+fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
-    if first {
+    if worker == 0 {
         // The other threads wait on this table, so a failure must not leave them waiting.
         let began = Instant::now();
         let links = read_links(shared, &mut block).unwrap_or_else(|error| {
@@ -732,7 +758,7 @@ fn parse_worker(shared: &Shared, first: bool) -> io::Result<(EventSource, Bucket
         let _ = shared.links.set(links);
     }
     let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
-    let mut clicks = Buckets::new(1 << shared.person_bits);
+    let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
@@ -1039,7 +1065,7 @@ fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
 fn session_worker(
     shared: &Shared,
     events: &[Buckets<Event>],
-    clicks: &[Buckets<Click>],
+    clicks: &[ClickSource],
     order: &[u32],
     next: &AtomicUsize,
     thread: usize,
@@ -1154,7 +1180,7 @@ fn session_worker(
         // The clicks of the people who have events, grouped the same way.
         click_chunks.clear();
         for source in clicks {
-            source.chunks(part, &mut click_chunks);
+            source.buckets.chunks(part, &mut click_chunks);
         }
         click_ends.clear();
         click_ends.resize(persons.len(), 0);
@@ -1229,7 +1255,7 @@ fn session_worker(
             }
             let reached = &mut touches[click_from..click_to];
             if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| keys::compare(a.id, b.id)));
+                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
             }
             sessions.person(person, mine, reached)?;
             from = to;
@@ -1409,9 +1435,9 @@ fn main() -> io::Result<()> {
     let shared = &shared;
     let setup = began.elapsed();
 
-    let parsed: Vec<(EventSource, Buckets<Click>)> = std::thread::scope(|scope| {
+    let parsed: Vec<(EventSource, ClickSource)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| scope.spawn(move || parse_worker(shared, thread == 0)))
+            .map(|thread| scope.spawn(move || parse_worker(shared, thread)))
             .collect();
         handles
             .into_iter()
@@ -1520,7 +1546,7 @@ fn main() -> io::Result<()> {
                 // The parsed slabs hold the events too by now.
                 parsed_events[thread].buckets.release();
                 events[thread].release();
-                clicks[thread].release();
+                clicks[thread].buckets.release();
                 while let Some(&(file, start, end)) = segments.get(next.fetch_add(1, Ordering::Relaxed)) {
                     shared.files[file].release(start, end);
                 }
