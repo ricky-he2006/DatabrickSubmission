@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -281,101 +282,91 @@ struct Links {
 
 impl Links {
     fn build(pairs: &[(u64, u64)], threads: usize) -> Self {
+        if pairs.is_empty() {
+            return Self {
+                slots: Vec::new(),
+                shift: 64,
+                empty: true,
+            };
+        }
         let capacity = (pairs.len() * 3).next_power_of_two().max(16);
         let mask = capacity - 1;
         let shift = 64 - capacity.trailing_zeros();
         let mut slots = vec![[0u64; 2]; capacity];
         huge(slots.as_ptr(), capacity);
         fault_slab(slots.as_ptr() as *const u8, capacity * std::mem::size_of::<[u64; 2]>());
-        let mut names: Vec<u64> = Vec::new();
         let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
 
-        fn find(parent: &mut [u32], mut at: u32) -> u32 {
-            loop {
-                let up = parent[at as usize];
-                if up == at {
-                    return at;
+        #[inline(always)]
+        unsafe fn find(slots: *mut [u64; 2], mut at: usize) -> usize {
+            unsafe {
+                loop {
+                    let up = (*slots.add(at))[1] as usize;
+                    if up == at {
+                        return at;
+                    }
+                    let above = (*slots.add(up))[1] as usize;
+                    (*slots.add(at))[1] = above as u64;
+                    at = above;
                 }
-                let above = parent[up as usize];
-                parent[at as usize] = above;
-                at = above;
             }
         }
 
-        // Number the IDs as they appear; each pass below prefetches what the
-        // pass will touch a few steps on, since every touch is a cache miss.
-        let mut numbered: Vec<[u32; 2]> = Vec::with_capacity(pairs.len());
+        let slots_ptr = slots.as_mut_ptr();
         for (at, &(a, b)) in pairs.iter().enumerate() {
-            if let Some(&(c, d)) = pairs.get(at + 8) {
+            if let Some(&(c, d)) = pairs.get(at + 16) {
                 prefetch(&slots[home(c)]);
                 prefetch(&slots[home(d)]);
             }
-            let mut index = [0u32; 2];
+            let mut indices = [0usize; 2];
             for (side, key) in [a, b].into_iter().enumerate() {
                 let mut slot = home(key);
-                index[side] = loop {
-                    let entry = &mut slots[slot];
+                indices[side] = loop {
+                    let entry = unsafe { &mut *slots_ptr.add(slot) };
                     if entry[0] == key {
-                        break entry[1] as u32;
+                        break slot;
                     }
                     if entry[0] == 0 {
-                        *entry = [key, names.len() as u64];
-                        names.push(key);
-                        break (names.len() - 1) as u32;
+                        *entry = [key, slot as u64];
+                        break slot;
                     }
                     slot = (slot + 1) & mask;
                 };
             }
-            numbered.push(index);
-        }
-        // Join. The smaller number is the root, so no cycle can form.
-        let mut parent: Vec<u32> = (0..names.len() as u32).collect();
-        for (at, &[a, b]) in numbered.iter().enumerate() {
-            if let Some(&[c, d]) = numbered.get(at + 8) {
-                prefetch(&parent[c as usize]);
-                prefetch(&parent[d as usize]);
-            }
-            let a = find(&mut parent, a);
-            let b = find(&mut parent, b);
-            if a != b {
-                let root = a.min(b) as usize;
-                let child = a.max(b) as usize;
-                parent[child] = root as u32;
-                if keys::compare(names[child], names[root]) == Order::Less {
-                    names[root] = names[child];
+            let root_a = unsafe { find(slots_ptr, indices[0]) };
+            let root_b = unsafe { find(slots_ptr, indices[1]) };
+            if root_a != root_b {
+                let key_a = unsafe { (*slots_ptr.add(root_a))[0] };
+                let key_b = unsafe { (*slots_ptr.add(root_b))[0] };
+                if keys::compare(key_a, key_b) == Order::Less {
+                    unsafe { (*slots_ptr.add(root_b))[1] = root_a as u64 };
+                } else {
+                    unsafe { (*slots_ptr.add(root_a))[1] = root_b as u64 };
                 }
             }
         }
-        // Parents always have smaller indices. In ascending order their
-        // canonical names have already been resolved, even along long chains.
-        for (id, &up) in parent.iter().enumerate() {
-            names[id] = names[up as usize];
+
+        // Pass 2: Flatten all trees so every slot points directly to its root slot.
+        for entry in &mut slots {
+            if entry[0] != 0 {
+                entry[1] = unsafe { find(slots_ptr, entry[1] as usize) as u64 };
+            }
         }
-        if threads > 1 && slots.len() >= threads * 4096 {
-            let chunk_size = slots.len().div_ceil(threads);
-            let names = &names;
-            std::thread::scope(|scope| {
-                for chunk in slots.chunks_mut(chunk_size) {
-                    scope.spawn(move || {
-                        for entry in chunk {
-                            if entry[0] != 0 {
-                                entry[1] = names[entry[1] as usize];
-                            }
-                        }
-                    });
-                }
-            });
-        } else {
-            for entry in &mut slots {
+
+        // Pass 3: Convert the root slot index in entry[1] to the canonical key of that root.
+        for i in 0..slots.len() {
+            unsafe {
+                let entry = &mut *slots_ptr.add(i);
                 if entry[0] != 0 {
-                    entry[1] = names[entry[1] as usize];
+                    let root = entry[1] as usize;
+                    entry[1] = (*slots_ptr.add(root))[0];
                 }
             }
         }
         Self {
             slots,
             shift,
-            empty: pairs.is_empty(),
+            empty: false,
         }
     }
 
@@ -514,7 +505,7 @@ struct Shared {
     defer_long_events: bool,
     person_bits: u32,
     ahead: usize,
-    links: Links,
+    links: OnceLock<Links>,
     output: PathBuf,
     /// Days from the first day a session can start on to the last, inclusive.
     days: usize,
@@ -569,73 +560,29 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-struct LinkChunk {
-    file_idx: usize,
-    start: u64,
-    end: u64,
-}
-
-fn load_links(link_files: &[PathBuf], threads: usize) -> io::Result<Links> {
-    if link_files.is_empty() {
-        return Ok(Links::build(&[], threads));
-    }
-    let mut sources = Vec::with_capacity(link_files.len());
-    let mut chunks = Vec::new();
-    for (file_idx, path) in link_files.iter().enumerate() {
+fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
+    let total_bytes: u64 = shared.link_files.iter().map(|p| p.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+    let mut pairs: Vec<(u64, u64)> = Vec::with_capacity((total_bytes / 20) as usize);
+    for path in &shared.link_files {
         let source = Source::open(path, true)?;
         let size = source.size;
         let mut start = 0;
         while start < size {
             let end = (start + LINK_BLOCK).min(size);
-            chunks.push(LinkChunk { file_idx, start, end });
-            start = end;
-        }
-        sources.push(source);
-    }
-    if chunks.is_empty() {
-        return Ok(Links::build(&[], threads));
-    }
-
-    let chunk_results: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..chunks.len())
-        .map(|_| std::sync::Mutex::new(Vec::new()))
-        .collect();
-    let next_chunk = AtomicUsize::new(0);
-
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                let mut block = Block::new();
-                let mut local_pairs = Vec::with_capacity(4096);
-                loop {
-                    let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    if chunk_idx >= chunks.len() {
-                        break;
-                    }
-                    let chunk = &chunks[chunk_idx];
-                    local_pairs.clear();
-                    if block.load(&sources[chunk.file_idx], chunk.start, chunk.end).is_ok() {
-                        block.raw_lines::<2>(|buf, start, seps| unsafe {
-                            let (p, n) = scan::field(buf, start, seps, 0);
-                            let a = keys::pack_user(p, n);
-                            let (p, n) = scan::field(buf, start, seps, 1);
-                            let b = keys::pack_user(p, n);
-                            if a != 0 && b != 0 && a != b {
-                                local_pairs.push((a, b));
-                            }
-                        });
-                        *chunk_results[chunk_idx].lock().unwrap() = std::mem::take(&mut local_pairs);
-                    }
+            block.load(&source, start, end)?;
+            block.raw_lines::<2>(|buf, start, seps| unsafe {
+                let (p, n) = scan::field(buf, start, seps, 0);
+                let a = keys::pack_user(p, n);
+                let (p, n) = scan::field(buf, start, seps, 1);
+                let b = keys::pack_user(p, n);
+                if a != 0 && b != 0 && a != b {
+                    pairs.push((a, b));
                 }
             });
+            start = end;
         }
-    });
-
-    let total_pairs: usize = chunk_results.iter().map(|m| m.lock().unwrap().len()).sum();
-    let mut pairs = Vec::with_capacity(total_pairs);
-    for m in chunk_results {
-        pairs.append(&mut *m.lock().unwrap());
     }
-    Ok(Links::build(&pairs, threads))
+    Ok(Links::build(&pairs, 1))
 }
 
 #[inline(always)]
@@ -861,7 +808,12 @@ fn parse_clicks(
             campaign,
         });
     });
-    let links = &shared.links;
+    let links = loop {
+        if let Some(l) = shared.links.get() {
+            break l;
+        }
+        std::hint::spin_loop();
+    };
     for at in 0..pending.len() {
         if let Some(ahead) = pending.get(at + shared.ahead) {
             links.prefetch(ahead.user);
@@ -882,6 +834,15 @@ fn parse_clicks(
 
 fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
+    if worker == 0 {
+        let began = Instant::now();
+        let links = read_links(shared, &mut block).unwrap_or_else(|error| {
+            eprintln!("links: {error}");
+            std::process::exit(1);
+        });
+        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
+        let _ = shared.links.set(links);
+    }
     let mut events = EventSource::new(1 << shared.id_bits);
     let mut clicks = ClickSource::new(1 << shared.person_bits, worker);
     let mut pending = Vec::new();
@@ -900,7 +861,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 // ---------------------------------------------------------------- phase 2
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
-    let links = &shared.links;
+    let links = shared.links.get().unwrap();
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
@@ -1532,9 +1493,6 @@ fn main() -> io::Result<()> {
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let link_files = csv_files(&data.join("links"))?;
-    let began_links = Instant::now();
-    let links = load_links(&link_files, threads)?;
-    LINKS_MICROS.store(began_links.elapsed().as_micros() as usize, Ordering::Relaxed);
     let shared = Shared {
         window_start,
         window_end,
@@ -1552,7 +1510,7 @@ fn main() -> io::Result<()> {
         id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
-        links,
+        links: OnceLock::new(),
         output,
         days: ((window_end - 1).div_euclid(DAY) - first_day + 1) as usize,
         day_offset,
@@ -1681,7 +1639,9 @@ fn main() -> io::Result<()> {
             });
         }
         if give_back {
-            crate::release(shared.links.slots.as_ptr(), shared.links.slots.len());
+            if let Some(links) = shared.links.get() {
+                crate::release(links.slots.as_ptr(), links.slots.len());
+            }
         }
     });
     let total = began.elapsed();
