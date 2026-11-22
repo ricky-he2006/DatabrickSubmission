@@ -2,7 +2,7 @@
 # The scorers build this natively on linux/amd64; on an Apple-silicon Mac the
 # builder stage cross-compiles, so `docker buildx build --platform linux/amd64`
 # stays fast there too.
-FROM --platform=$BUILDPLATFORM rust:1.85-slim-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.90-slim-bookworm AS builder
 ARG BUILDARCH
 ARG TARGETARCH
 WORKDIR /src
