@@ -2093,6 +2093,9 @@ pub fn stage1(g: &G, tid: usize) {
     let (q, nckl) = work_queue(g);
     let nckl = *nckl;
     let inq = d.st2q;
+    // Let one thread of each pair continue scanning while its partner
+    // processes ready click-index jobs. All workers drain the queue at EOF.
+    let prioritize_links = inq && tid % 2 == 0;
     let mut us_open = true;
     let mut sc = crate::links::Scratch::default();
     #[cfg(feature = "tl")]
@@ -2100,7 +2103,7 @@ pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "tl")]
     let mut first = true;
     loop {
-        if inq && !us_open {
+        if prioritize_links && !us_open {
             while crate::links::job(g, &mut *t, &mut sc) {}
         }
         let i = g.qnext.fetch_add(1, Ordering::Relaxed);
@@ -2111,7 +2114,7 @@ pub fn stage1(g: &G, tid: usize) {
                 unsafe { crate::ckix::flush(&mut out.pd, g.csr) };
             }
             crate::links::us_finished(g, out.pd.end, inq);
-            if inq {
+            if prioritize_links {
                 while crate::links::job(g, &mut *t, &mut sc) {}
             }
         }
