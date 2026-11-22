@@ -576,6 +576,56 @@ struct TailRow {
     pp: [u64; 4],
     _pad: u64,
 }
+#[derive(Clone, Copy, Default)]
+struct TailLayout {
+    mask: u32,
+    distance: u8,
+    kind_width: u8,
+    tail_index: u16,
+}
+
+const LAYOUT_HASH: u32 = 0xc7e5fef;
+const fn layout_slot(mask: u32) -> usize {
+    (mask.wrapping_mul(LAYOUT_HASH) >> 20) as usize
+}
+
+const fn tail_layouts() -> [TailLayout; 4096] {
+    let empty = TailLayout { mask: 0, distance: 0, kind_width: 0, tail_index: 0 };
+    let mut rows = [empty; 4096];
+    let mut kind = 4;
+    while kind <= 10 {
+        let mut product = 0;
+        while kind + product <= 21 {
+            let mut price = 0;
+            while kind + product + price <= 21 {
+                let distance = kind + product + price + 3;
+                let mask = (1 << (23 - price)) | (1 << (22 - price - product)) | (1 << (24 - distance));
+                let slot = layout_slot(mask);
+                if rows[slot].mask == 0 {
+                    rows[slot] = TailLayout { mask, distance: distance as u8, kind_width: kind as u8,
+                                              tail_index: (product * TAIL_K + price) as u16 };
+                }
+                price += 1;
+            }
+            product += 1;
+        }
+        kind += 2;
+    }
+    rows
+}
+static LAYOUTS: [TailLayout; 4096] = tail_layouts();
+
+#[cold]
+#[inline(never)]
+fn uncommon_tail(tb: u64, m: u64) -> (u64, u64, u64) {
+    let z = tb.leading_zeros() as u64;
+    let r6 = m.wrapping_add(z).wrapping_sub(64);
+    let remaining = tb.wrapping_shl(z as u32) << 1;
+    let r5 = remaining.leading_zeros() as u64;
+    let r4 = (remaining.wrapping_shl(r5 as u32) << 1).leading_zeros() as u64;
+    let i4 = z.wrapping_add(r5).wrapping_add(r4).wrapping_add(1) ^ 63;
+    (i4, r4, r5 * TAIL_K as u64 + r6)
+}
 const TAIL_NO: u32 = u32::MAX;
 const TAIL_K: usize = 72;
 const TAIL_ROWS: usize = 63 * TAIL_K + 64;
@@ -1276,20 +1326,19 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let c1 = tz2(t);
         let c2 = tz(blsr(t));
         let tb = bzhi(wbc, m);
-        let z = _lzcnt_u64(tb);
-        let r6 = lea3::<-64>(m, z);
-        let t = tb.wrapping_shl(z as u32) << 1;
-        let r5 = _lzcnt_u64(t);
-        let t = t.wrapping_shl(r5 as u32) << 1;
-        let r4 = _lzcnt_u64(t);
-        let zr = z.wrapping_add(r5);
-        let i4 = lea3::<1>(zr, r4) ^ 63;
+        let key = (tb.wrapping_shl((64 - m) as u32) >> 40) as u32;
+        let layout = LAYOUTS[layout_slot(key)];
+        let (i4, r4, tail_index) = if key != 0 && layout.mask == key {
+            (m + 1 - layout.distance as u64, layout.kind_width as u64, layout.tail_index as u64)
+        } else {
+            uncommon_tail(tb, m)
+        };
         let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
         if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) {
             return None;
         }
         core::arch::asm!("test {u}, -3", "jnz {fail}", u = in(reg) u3, fail = label { return None; }, options(nomem, nostack));
-        let tr = &*((T.tail.as_ptr() as *const u8).add((here(r5 * TAIL_K as u64 + r6) as usize) << 6) as *const TailRow);
+        let tr = &*((T.tail.as_ptr() as *const u8).add((here(tail_index) as usize) << 6) as *const TailRow);
         let q32 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(pb.wrapping_add(m as usize).wrapping_sub(32) as *const __m256i), _mm256_set1_epi8(b'"' as i8))) as u32;
         let qw = q32 & tr.m;
         let qi = _pext_u32(qw, tr.sel) as usize;
