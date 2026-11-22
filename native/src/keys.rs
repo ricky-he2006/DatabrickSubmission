@@ -4,11 +4,10 @@
 //! is interned in a sharded table and gets bit 63. Key 0 is the empty string.
 
 use std::cmp::Ordering;
-use std::hash::{BuildHasher, RandomState};
 use std::sync::{LazyLock, Mutex};
 
 pub const INTERNED: u64 = 1 << 63;
-const SHARDS: usize = 256;
+const SHARDS: usize = 4096;
 
 #[derive(Default)]
 struct Names {
@@ -54,13 +53,37 @@ impl Names {
     }
 }
 
-static HASH: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 static NAMES: LazyLock<[Mutex<Names>; SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| Mutex::new(Names::default())));
 
-#[inline]
-pub fn hash_bytes(value: &[u8]) -> u64 {
-    HASH.hash_one(value)
+#[inline(always)]
+pub fn hash_bytes(bytes: &[u8]) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    unsafe {
+        use std::arch::x86_64::_mm_crc32_u64;
+        let mut crc = 0x9E37_79B9_7F4A_7C15u64;
+        let mut ptr = bytes.as_ptr();
+        let mut len = bytes.len();
+        while len >= 8 {
+            crc = _mm_crc32_u64(crc, (ptr as *const u64).read_unaligned());
+            ptr = ptr.add(8);
+            len -= 8;
+        }
+        if len > 0 {
+            let mut tail = 0u64;
+            std::ptr::copy_nonoverlapping(ptr, &mut tail as *mut u64 as *mut u8, len);
+            crc = _mm_crc32_u64(crc, tail);
+        }
+        crc
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+    {
+        let mut h = 0x9E37_79B9_7F4A_7C15u64;
+        for &b in bytes {
+            h = (h ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+        h
+    }
 }
 
 #[inline]
@@ -70,15 +93,17 @@ fn intern(value: &[u8]) -> u64 {
 
 fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
     let hash = hash_bytes(value);
-    let shard = (hash >> 56) as usize;
+    let shard = (hash as usize) & (SHARDS - 1);
     let mut table = NAMES[shard].lock().unwrap();
     let i = table.insert(hash, value);
-    (INTERNED | ((i as u64) << 8) | shard as u64, table.entries[i].1)
+    let name_slice = table.entries[i].1;
+    let key = INTERNED | ((name_slice.len() as u64) << 48) | (name_slice.as_ptr() as u64);
+    (key, name_slice)
 }
 
 thread_local! {
     static USERS: std::cell::RefCell<Vec<(u64, &'static [u8])>> =
-        std::cell::RefCell::new(vec![(0, &[]); 1 << 15]);
+        std::cell::RefCell::new(vec![(0, &[]); 1 << 18]);
 }
 
 /// Repeated long user names can be resolved by comparing their full bytes
@@ -90,20 +115,24 @@ pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
     }
     let value = unsafe { std::slice::from_raw_parts(p, n) };
     let prefix = u64::from_le_bytes(value[1..9].try_into().unwrap());
-    let slot = (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 49) as usize;
+    let slot = (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 46) as usize & ((1 << 18) - 1);
     USERS.with(|cache| {
         let mut cache = cache.borrow_mut();
         let entry = &mut cache[slot];
-        if entry.1 != value {
-            *entry = intern_name(value);
+        if entry.1 == value {
+            return entry.0;
         }
-        entry.0
+        let res = intern_name(value);
+        *entry = res;
+        res.0
     })
 }
 
+#[inline(always)]
 fn name(key: u64) -> &'static [u8] {
-    let shard = (key & 255) as usize;
-    NAMES[shard].lock().unwrap().entries[((key & !INTERNED) >> 8) as usize].1
+    let ptr = (key & 0x0000_FFFF_FFFF_FFFF) as *const u8;
+    let len = ((key >> 48) & 0x7FFF) as usize;
+    unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
 /// The key of the `len` bytes at `p`. At least 9 bytes must be readable at `p`.

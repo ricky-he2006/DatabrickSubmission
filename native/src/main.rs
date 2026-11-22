@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -220,13 +219,6 @@ struct RawClick {
     campaign: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Touch {
-    id: u64,
-    ts: u32,
-    campaign: u32,
-}
-
 // ---------------------------------------------------------------- lookups
 
 /// `prefix` + number IDs in a dense table, anything else in a map. 0 is absent.
@@ -281,12 +273,13 @@ struct Links {
 }
 
 impl Links {
-    fn build(pairs: &[(u64, u64)]) -> Self {
+    fn build(pairs: &[(u64, u64)], threads: usize) -> Self {
         let capacity = (pairs.len() * 3).next_power_of_two().max(16);
         let mask = capacity - 1;
         let shift = 64 - capacity.trailing_zeros();
         let mut slots = vec![[0u64; 2]; capacity];
         huge(slots.as_ptr(), capacity);
+        fault_slab(slots.as_ptr() as *const u8, capacity * std::mem::size_of::<[u64; 2]>());
         let mut names: Vec<u64> = Vec::new();
         let home = |key: u64| (key.wrapping_mul(MIX) >> shift) as usize;
 
@@ -351,9 +344,25 @@ impl Links {
         for (id, &up) in parent.iter().enumerate() {
             names[id] = names[up as usize];
         }
-        for entry in &mut slots {
-            if entry[0] != 0 {
-                entry[1] = names[entry[1] as usize];
+        if threads > 1 && slots.len() >= threads * 4096 {
+            let chunk_size = slots.len().div_ceil(threads);
+            let names = &names;
+            std::thread::scope(|scope| {
+                for chunk in slots.chunks_mut(chunk_size) {
+                    scope.spawn(move || {
+                        for entry in chunk {
+                            if entry[0] != 0 {
+                                entry[1] = names[entry[1] as usize];
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for entry in &mut slots {
+                if entry[0] != 0 {
+                    entry[1] = names[entry[1] as usize];
+                }
             }
         }
         Self {
@@ -498,7 +507,7 @@ struct Shared {
     defer_long_events: bool,
     person_bits: u32,
     ahead: usize,
-    links: OnceLock<Links>,
+    links: Links,
     output: PathBuf,
     /// Days from the first day a session can start on to the last, inclusive.
     days: usize,
@@ -553,28 +562,73 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
-    let mut pairs: Vec<(u64, u64)> = Vec::new();
-    for path in &shared.link_files {
+struct LinkChunk {
+    file_idx: usize,
+    start: u64,
+    end: u64,
+}
+
+fn load_links(link_files: &[PathBuf], threads: usize) -> io::Result<Links> {
+    if link_files.is_empty() {
+        return Ok(Links::build(&[], threads));
+    }
+    let mut sources = Vec::with_capacity(link_files.len());
+    let mut chunks = Vec::new();
+    for (file_idx, path) in link_files.iter().enumerate() {
         let source = Source::open(path, true)?;
         let size = source.size;
         let mut start = 0;
         while start < size {
             let end = (start + LINK_BLOCK).min(size);
-            block.load(&source, start, end)?;
-            block.raw_lines::<2>(|buf, start, seps| unsafe {
-                let (p, n) = scan::field(buf, start, seps, 0);
-                let a = keys::pack_user(p, n);
-                let (p, n) = scan::field(buf, start, seps, 1);
-                let b = keys::pack_user(p, n);
-                if a != 0 && b != 0 && a != b {
-                    pairs.push((a, b));
-                }
-            });
+            chunks.push(LinkChunk { file_idx, start, end });
             start = end;
         }
+        sources.push(source);
     }
-    Ok(Links::build(&pairs))
+    if chunks.is_empty() {
+        return Ok(Links::build(&[], threads));
+    }
+
+    let chunk_results: Vec<std::sync::Mutex<Vec<(u64, u64)>>> = (0..chunks.len())
+        .map(|_| std::sync::Mutex::new(Vec::new()))
+        .collect();
+    let next_chunk = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut block = Block::new();
+                let mut local_pairs = Vec::with_capacity(4096);
+                loop {
+                    let chunk_idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+                    if chunk_idx >= chunks.len() {
+                        break;
+                    }
+                    let chunk = &chunks[chunk_idx];
+                    local_pairs.clear();
+                    if block.load(&sources[chunk.file_idx], chunk.start, chunk.end).is_ok() {
+                        block.raw_lines::<2>(|buf, start, seps| unsafe {
+                            let (p, n) = scan::field(buf, start, seps, 0);
+                            let a = keys::pack_user(p, n);
+                            let (p, n) = scan::field(buf, start, seps, 1);
+                            let b = keys::pack_user(p, n);
+                            if a != 0 && b != 0 && a != b {
+                                local_pairs.push((a, b));
+                            }
+                        });
+                    }
+                    *chunk_results[chunk_idx].lock().unwrap() = std::mem::take(&mut local_pairs);
+                }
+            });
+        }
+    });
+
+    let total_pairs: usize = chunk_results.iter().map(|c| c.lock().unwrap().len()).sum();
+    let mut all_pairs = Vec::with_capacity(total_pairs);
+    for c in chunk_results {
+        all_pairs.extend(c.into_inner().unwrap());
+    }
+    Ok(Links::build(&all_pairs, threads))
 }
 
 #[inline(always)]
@@ -737,12 +791,7 @@ fn parse_clicks(
             campaign,
         });
     });
-    let links = loop {
-        match shared.links.get() {
-            Some(links) => break links,
-            None => std::thread::yield_now(),
-        }
-    };
+    let links = &shared.links;
     for at in 0..pending.len() {
         if let Some(ahead) = pending.get(at + shared.ahead) {
             links.prefetch(ahead.user);
@@ -763,16 +812,6 @@ fn parse_clicks(
 
 fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
-    if worker == 0 {
-        // The other threads wait on this table, so a failure must not leave them waiting.
-        let began = Instant::now();
-        let links = read_links(shared, &mut block).unwrap_or_else(|error| {
-            eprintln!("links: {error}");
-            std::process::exit(1);
-        });
-        LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
-        let _ = shared.links.set(links);
-    }
     let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
@@ -791,7 +830,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
 // ---------------------------------------------------------------- phase 2
 
 fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) -> Buckets<Event> {
-    let links = shared.links.get().unwrap();
+    let links = &shared.links;
     // The events go into the memory of the parsed records they came from: a
     // parsed chunk, once read, is room for one chunk of events.
     let mut out = Buckets::new(1 << shared.person_bits);
@@ -950,7 +989,7 @@ impl Sessions<'_> {
     }
 
     /// One person: their events sorted by time, their clicks by time then ID.
-    fn person(&mut self, person: u64, events: &[u64], clicks: &[Touch]) -> io::Result<()> {
+    fn person(&mut self, person: u64, events: &[Event], clicks: &[Click]) -> io::Result<()> {
         let days = self.shared.days;
         let day_offset = self.shared.day_offset;
         let (mut low, mut high) = (0usize, 0usize);
@@ -958,7 +997,7 @@ impl Sessions<'_> {
         let mut current = NONE;
         let (mut day_sessions, mut day_events, mut day_revenue) = (0u32, 0u32, 0u64);
         while at < events.len() {
-            let start = events[at] >> 32;
+            let start = events[at].value >> 32;
             let day = ((start + day_offset) / DAY as u64) as u32;
             if day != current {
                 if current != NONE {
@@ -972,7 +1011,7 @@ impl Sessions<'_> {
             let mut purchased = false;
             let first = at;
             while at < events.len() {
-                let value = events[at];
+                let value = events[at].value;
                 let time = value >> 32;
                 if time - previous > SESSION_GAP {
                     break;
@@ -1048,34 +1087,126 @@ impl Sessions<'_> {
     }
 }
 
-/// Sorts many events of one person by their `ts` (the top 32 bits): three
-/// counting passes of 11 bits. Whales have a million events each.
-fn sort_by_time(values: &mut [u64], scratch: &mut Vec<u64>) {
-    scratch.clear();
-    scratch.resize(values.len(), 0);
-    let mut histograms = [[0u32; 2048]; 3];
-    for &value in values.iter() {
-        histograms[0][(value >> 32) as usize & 2047] += 1;
-        histograms[1][(value >> 43) as usize & 2047] += 1;
-        histograms[2][(value >> 54) as usize] += 1;
-    }
-    let (mut from, mut to) = (&mut values[..], &mut scratch[..]);
-    for (shift, counts) in [32, 43, 54].into_iter().zip(&mut histograms) {
-        let mut sum = 0;
-        for count in counts.iter_mut() {
-            let here = *count;
-            *count = sum;
-            sum += here;
+// Sparse digit counts avoid clearing two 64K tables for each person bucket.
+struct DigitPass {
+    counts: Vec<usize>,
+    used: Vec<u16>,
+}
+
+impl DigitPass {
+    fn new() -> Self {
+        Self {
+            counts: vec![0; 65536],
+            used: Vec::new(),
         }
-        for &value in from.iter() {
-            let slot = &mut counts[(value >> shift) as usize & 2047];
-            to[*slot as usize] = value;
-            *slot += 1;
-        }
-        std::mem::swap(&mut from, &mut to);
     }
-    // Three passes: the sorted values are in the scratch buffer.
-    to.copy_from_slice(from);
+    #[inline]
+    fn count(&mut self, digit: u16) {
+        let slot = &mut self.counts[digit as usize];
+        if *slot == 0 {
+            self.used.push(digit);
+        }
+        *slot += 1;
+    }
+    fn offsets(&mut self) -> usize {
+        self.used.sort_unstable();
+        let mut end = 0;
+        for &digit in &self.used {
+            let count = &mut self.counts[digit as usize];
+            let size = *count;
+            *count = end;
+            end += size;
+        }
+        end
+    }
+    #[inline]
+    fn next(&mut self, digit: u16) -> usize {
+        let slot = &mut self.counts[digit as usize];
+        let next = *slot;
+        *slot += 1;
+        next
+    }
+    fn clear(&mut self) {
+        for digit in self.used.drain(..) {
+            self.counts[digit as usize] = 0;
+        }
+    }
+}
+
+struct Scatter<T> {
+    low: DigitPass,
+    high: DigitPass,
+    first: Vec<std::mem::MaybeUninit<T>>,
+    result: Vec<std::mem::MaybeUninit<T>>,
+}
+
+impl<T: Copy> Scatter<T> {
+    fn new() -> Self {
+        Self {
+            low: DigitPass::new(),
+            high: DigitPass::new(),
+            first: Vec::new(),
+            result: Vec::new(),
+        }
+    }
+
+    fn group<I>(&mut self, rows: I, person: impl Fn(T) -> u64) -> &mut [T]
+    where
+        I: Iterator<Item = T> + Clone,
+    {
+        for row in rows.clone() {
+            let id = person(row);
+            self.low.count(id as u16);
+            self.high.count((id >> 16) as u16);
+        }
+        let count = self.low.offsets();
+        self.high.offsets();
+        self.first.resize_with(count, std::mem::MaybeUninit::uninit);
+        self.result.resize_with(count, std::mem::MaybeUninit::uninit);
+        for row in rows {
+            self.first[self.low.next(person(row) as u16)].write(row);
+        }
+        for row in &self.first {
+            // Every slot was assigned exactly once by the first scatter.
+            let row = unsafe { row.assume_init() };
+            self.result[self.high.next((person(row) >> 16) as u16)].write(row);
+        }
+        self.low.clear();
+        self.high.clear();
+        // Both histograms have counts for every accepted row. Each scatter
+        // initializes exactly one distinct slot for each row.
+        let result = unsafe { std::slice::from_raw_parts_mut(self.result.as_mut_ptr().cast(), count) };
+        for run in result.chunk_by_mut(|a, b| person(*a) as u32 == person(*b) as u32) {
+            if !run.iter().all(|row| person(*row) == person(run[0])) {
+                run.sort_unstable_by_key(|&row| person(row));
+            }
+        }
+        result
+    }
+}
+
+#[inline]
+fn chunk_rows<T: Copy>(chunks: &[(*mut T, usize)]) -> impl Iterator<Item = T> + Clone + '_ {
+    chunks.iter().flat_map(|&(ptr, len)| {
+        unsafe { std::slice::from_raw_parts(ptr, len) }.iter().copied()
+    })
+}
+
+fn insertion_sort<T: Copy>(rows: &mut [T], before: impl Fn(T, T) -> bool) {
+    for i in 1..rows.len() {
+        let value = rows[i];
+        let mut j = i;
+        while j > 0 && before(value, rows[j - 1]) {
+            rows[j] = rows[j - 1];
+            j -= 1;
+        }
+        rows[j] = value;
+    }
+}
+
+#[inline(always)]
+fn person_order(a: u64, b: u64) -> std::cmp::Ordering {
+    (a as u32, a).cmp(&(b as u32, b))
 }
 
 fn session_worker(
@@ -1100,182 +1231,60 @@ fn session_worker(
     };
     let mut event_chunks: Vec<(*mut Event, usize)> = Vec::new();
     let mut click_chunks: Vec<(*mut Click, usize)> = Vec::new();
-    let mut table_keys: Vec<u64> = Vec::new();
-    let mut table_ids: Vec<u32> = Vec::new();
-    let mut persons: Vec<u64> = Vec::new();
-    let mut ends: Vec<u32> = Vec::new();
-    let mut local: Vec<u32> = Vec::new();
-    let mut values: Vec<u64> = Vec::new();
-    let mut click_ends: Vec<u32> = Vec::new();
-    let mut click_local: Vec<u32> = Vec::new();
-    let mut touches: Vec<Touch> = Vec::new();
-    let mut scratch: Vec<u64> = Vec::new();
+    let (mut event_scatter, mut click_scatter) = (Scatter::new(), Scatter::new());
+
     while let Some(&part) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
         let part = part as usize;
         event_chunks.clear();
         for source in events {
             source.chunks(part, &mut event_chunks);
         }
-        let total: usize = event_chunks.iter().map(|chunk| chunk.1).sum();
-        if total == 0 {
+        if event_chunks.is_empty() {
             continue;
         }
 
-        // Group the events by person: number the people as they appear.
-        let mut capacity = (total / 4 + 16).next_power_of_two();
-        let mut mask = capacity - 1;
-        table_keys.clear();
-        table_keys.resize(capacity, 0);
-        table_ids.clear();
-        table_ids.resize(capacity, 0);
-        persons.clear();
-        ends.clear();
-        local.clear();
-        unsafe {
-            for &(base, count) in &event_chunks {
-                for offset in 0..count {
-                    let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
-                            let id = persons.len() as u32;
-                            *table_keys.get_unchecked_mut(slot) = person;
-                            *table_ids.get_unchecked_mut(slot) = id;
-                            persons.push(person);
-                            ends.push(0);
-                            break id;
-                        }
-                        slot = (slot + 1) & mask;
-                    };
-                    *ends.get_unchecked_mut(id as usize) += 1;
-                    local.push(id);
-                    if persons.len() * 2 > capacity {
-                        capacity *= 2;
-                        mask = capacity - 1;
-                        table_keys.clear();
-                        table_keys.resize(capacity, 0);
-                        table_ids.clear();
-                        table_ids.resize(capacity, 0);
-                        for (id, &person) in persons.iter().enumerate() {
-                            let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                            while table_keys[slot] != 0 {
-                                slot = (slot + 1) & mask;
-                            }
-                            table_keys[slot] = person;
-                            table_ids[slot] = id as u32;
-                        }
-                    }
-                }
-            }
-            // `ends` holds counts; make it each person's first slot, then fill,
-            // which leaves it at each person's end.
-            let mut sum = 0u32;
-            for end in ends.iter_mut() {
-                let count = *end;
-                *end = sum;
-                sum += count;
-            }
-            if values.len() < total {
-                values.resize(total, 0);
-            }
-            let mut index = 0;
-            for &(base, count) in &event_chunks {
-                for offset in 0..count {
-                    let end = ends.get_unchecked_mut(*local.get_unchecked(index) as usize);
-                    *values.get_unchecked_mut(*end as usize) = (*base.add(offset)).value;
-                    *end += 1;
-                    index += 1;
-                }
-            }
-        }
+        let sorted_events = event_scatter.group(chunk_rows(&event_chunks), |event| event.person);
 
-        // The clicks of the people who have events, grouped the same way.
         click_chunks.clear();
         for source in clicks {
             source.buckets.chunks(part, &mut click_chunks);
         }
-        click_ends.clear();
-        click_ends.resize(persons.len(), 0);
-        click_local.clear();
-        let mut kept = 0usize;
-        unsafe {
-            for &(base, count) in &click_chunks {
-                for offset in 0..count {
-                    let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
-                    let id = loop {
-                        let key = *table_keys.get_unchecked(slot);
-                        if key == person {
-                            break *table_ids.get_unchecked(slot);
-                        }
-                        if key == 0 {
-                            break NONE;
-                        }
-                        slot = (slot + 1) & mask;
-                    };
-                    click_local.push(id);
-                    if id != NONE {
-                        *click_ends.get_unchecked_mut(id as usize) += 1;
-                        kept += 1;
-                    }
-                }
-            }
-            let mut sum = 0u32;
-            for end in click_ends.iter_mut() {
-                let count = *end;
-                *end = sum;
-                sum += count;
-            }
-            if touches.len() < kept {
-                touches.resize(
-                    kept,
-                    Touch {
-                        id: 0,
-                        ts: 0,
-                        campaign: 0,
-                    },
-                );
-            }
-            let mut index = 0;
-            for &(base, count) in &click_chunks {
-                for offset in 0..count {
-                    let id = *click_local.get_unchecked(index);
-                    index += 1;
-                    if id != NONE {
-                        let click = *base.add(offset);
-                        let end = click_ends.get_unchecked_mut(id as usize);
-                        *touches.get_unchecked_mut(*end as usize) = Touch {
-                            id: click.id,
-                            ts: click.ts,
-                            campaign: click.campaign,
-                        };
-                        *end += 1;
-                    }
-                }
-            }
-        }
 
-        let (mut from, mut click_from) = (0usize, 0usize);
-        for (id, &person) in persons.iter().enumerate() {
-            let to = ends[id] as usize;
-            let click_to = click_ends[id] as usize;
-            let mine = &mut values[from..to];
-            if mine.len() > 2048 {
-                sort_by_time(mine, &mut scratch);
+        let sorted_clicks = if click_chunks.is_empty() {
+            &mut []
+        } else {
+            click_scatter.group(chunk_rows(&click_chunks), |click| click.person)
+        };
+
+        let mut click_idx = 0;
+        for events in sorted_events.chunk_by_mut(|a, b| a.person == b.person) {
+            let person = events[0].person;
+            while click_idx < sorted_clicks.len() && person_order(sorted_clicks[click_idx].person, person).is_lt() {
+                click_idx += 1;
+            }
+            let click_start = click_idx;
+            while click_idx < sorted_clicks.len() && sorted_clicks[click_idx].person == person {
+                click_idx += 1;
+            }
+            let person_clicks = &mut sorted_clicks[click_start..click_idx];
+
+            const SMALL: usize = 24;
+            if events.len() <= SMALL {
+                insertion_sort(events, |a, b| a.value < b.value);
             } else {
-                mine.sort_unstable();
+                events.sort_unstable_by_key(|event| event.value);
             }
-            let reached = &mut touches[click_from..click_to];
-            if reached.len() > 1 {
-                reached.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events)));
+
+            let compare_clicks = |a: &Click, b: &Click| {
+                a.ts.cmp(&b.ts).then_with(|| click_order(a.id, b.id, clicks, shared.defer_long_events))
+            };
+            if person_clicks.len() <= SMALL {
+                insertion_sort(person_clicks, |a, b| compare_clicks(&a, &b).is_lt());
+            } else {
+                person_clicks.sort_unstable_by(compare_clicks);
             }
-            sessions.person(person, mine, reached)?;
-            from = to;
-            click_from = click_to;
+
+            sessions.person(person, events, person_clicks)?;
         }
     }
     let wrote = sessions.writer.is_some();
@@ -1318,10 +1327,8 @@ fn main() -> io::Result<()> {
     HUGE.store(tune("SS_HUGE", 1) as usize, Ordering::Relaxed);
     POPULATE.store(tune("SS_POPULATE", 0) as usize, Ordering::Relaxed);
     let block = tune("SS_BLOCK", BLOCK).max(4096);
-    // Reuse worker read buffers on Linux to avoid establishing mappings
-    // for the entire input. SS_MAP=1 selects the mapped scanner.
-    let map = tune("SS_MAP", if cfg!(target_os = "linux") { 0 } else { 1 }) != 0;
-    let give_back = tune("SS_RELEASE", 1) != 0;
+    let map = tune("SS_MAP", 1) != 0;
+    let give_back = tune("SS_RELEASE", 0) != 0;
     let copies = tune("SS_COPIES", 1).clamp(1, 100);
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
@@ -1423,6 +1430,10 @@ fn main() -> io::Result<()> {
     let partition_bits = input_bytes.div_ceil(1 << 20).max(threads as u64 * 8).ilog2();
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
+    let link_files = csv_files(&data.join("links"))?;
+    let began_links = Instant::now();
+    let links = load_links(&link_files, threads)?;
+    LINKS_MICROS.store(began_links.elapsed().as_micros() as usize, Ordering::Relaxed);
     let shared = Shared {
         window_start,
         window_end,
@@ -1435,12 +1446,12 @@ fn main() -> io::Result<()> {
         files,
         work,
         next: AtomicUsize::new(0),
-        link_files: csv_files(&data.join("links"))?,
+        link_files,
         defer_long_events: copies == 1,
         id_bits: tune("SS_ID_BITS", partition_bits.min(ID_BITS) as u64).clamp(1, 16) as u32,
         person_bits: tune("SS_PERSON_BITS", partition_bits.min(PERSON_BITS) as u64).clamp(1, 16) as u32,
         ahead: tune("SS_AHEAD", AHEAD as u64) as usize,
-        links: OnceLock::new(),
+        links,
         output,
         days: ((window_end - 1).div_euclid(DAY) - first_day + 1) as usize,
         day_offset,
@@ -1568,8 +1579,8 @@ fn main() -> io::Result<()> {
                 }
             });
         }
-        if let Some(links) = shared.links.get().filter(|_| give_back) {
-            crate::release(links.slots.as_ptr(), links.slots.len());
+        if give_back {
+            crate::release(shared.links.slots.as_ptr(), shared.links.slots.len());
         }
     });
     let total = began.elapsed();
@@ -1585,4 +1596,34 @@ fn main() -> io::Result<()> {
     );
     // Everything left is memory the kernel frees faster than we can.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod scatter_tests {
+    use super::*;
+
+    #[test]
+    fn groups_full_ids_when_low_32_bits_collide() {
+        let first = (1u64 << 48) | 0x30c0_437a;
+        let second = (2u64 << 48) | 0x30c0_437a;
+        let rows = [
+            Event { person: second, value: 45 },
+            Event { person: first, value: 10 },
+            Event { person: second, value: 12 },
+            Event { person: 1, value: 3 },
+        ];
+        let mut scatter = Scatter::new();
+        let result = scatter.group(rows.into_iter(), |event| event.person);
+        assert_eq!(
+            result.iter().map(|event| event.person).collect::<Vec<_>>(),
+            [1, first, second, second]
+        );
+        let last = &mut result[2..];
+        insertion_sort(last, |a, b| a.value < b.value);
+        assert_eq!(last.iter().map(|event| event.value).collect::<Vec<_>>(), [12, 45]);
+
+        let result = scatter.group(rows.into_iter().take(1), |event| event.person);
+        assert_eq!(result[0].person, second);
+        assert_eq!(result.len(), 1);
+    }
 }
