@@ -1148,53 +1148,6 @@ impl EvMasks {
     }
 }
 
-#[unsafe(naked)]
-unsafe extern "C" fn keep_k() {
-    core::arch::naked_asm!(
-        "sub rsp, 72",
-        "kmovq qword ptr [rsp], k0",
-        "kmovq qword ptr [rsp + 8], k1",
-        "kmovq qword ptr [rsp + 16], k2",
-        "kmovq qword ptr [rsp + 24], k3",
-        "kmovq qword ptr [rsp + 32], k4",
-        "kmovq qword ptr [rsp + 40], k5",
-        "kmovq qword ptr [rsp + 48], k6",
-        "kmovq qword ptr [rsp + 56], k7",
-        "vzeroupper",
-        "call rax",
-        "kmovq k0, qword ptr [rsp]",
-        "kmovq k1, qword ptr [rsp + 8]",
-        "kmovq k2, qword ptr [rsp + 16]",
-        "kmovq k3, qword ptr [rsp + 24]",
-        "kmovq k4, qword ptr [rsp + 32]",
-        "kmovq k5, qword ptr [rsp + 40]",
-        "kmovq k6, qword ptr [rsp + 48]",
-        "kmovq k7, qword ptr [rsp + 56]",
-        "add rsp, 72",
-        "ret",
-    )
-}
-macro_rules! kcall {
-    ($f:expr, $a0:expr, $a1:expr, $a2:expr, $a3:expr) => {{
-        core::hint::cold_path();
-        let (r0, r1): (u64, u64);
-        core::arch::asm!(
-            "call {t}",
-            t = sym keep_k,
-            inout("rax") $f as usize as u64 => r0,
-            inout("rdi") $a0 => _,
-            inout("rsi") $a1 => _,
-            inout("rdx") $a2 => r1,
-            inout("rcx") $a3 => _,
-            lateout("r8") _, lateout("r9") _, lateout("r10") _, lateout("r11") _,
-            out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
-            out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
-            out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
-            out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
-        );
-        (r0, r1)
-    }};
-}
 #[repr(C)]
 struct Pair(u64, u64);
 
@@ -1300,7 +1253,22 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let rs4 = pb.wrapping_add(i4 as usize);
         let kr = &*((T.kind2.as_ptr() as *const u8).add((here((r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize) as u64) as usize) << 6) as *const KindRow2);
         let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.maskv.as_ptr()));
-        *(s.byte_add(PP) as *mut u64) = *tr.pp.get_unchecked(qi) | kr.pp;
+        let pp = if kr.pp & (2 << 56) != 0 {
+            // The quote pattern and field widths were validated above.
+            // Reuse them for purchases while the row is still in registers.
+            let end = pb.add(m as usize);
+            let quote = qi >> 1;
+            let cents = price(end.sub(quote), r6 as usize - 2 * quote)?;
+            let shape = T.prod.get_unchecked(r5 as usize * 2 + (qi & 1));
+            let (product, bad) = dec(ld(end.sub(r6 as usize + 17)), shape);
+            if nz(bad) {
+                return None;
+            }
+            product as u64 | (cents as u64) << 32 | kr.pp | if cents == 0 { PP_INVALID } else { 0 }
+        } else {
+            *tr.pp.get_unchecked(qi) | kr.pp
+        };
+        *(s.byte_add(PP) as *mut u64) = pp;
         let ro = jid_off(c0 as u64, c1 as u64) as usize;
         let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
         let (ids, bad_i) = ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
@@ -1338,10 +1306,9 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
     unsafe {
         let s = *w;
         const A: usize = BATCH_ALIGN;
-        const PP: usize = core::mem::offset_of!(EvBatch, pp);
         macro_rules! cold {
             () => {{
-                let (r, nw) = kcall!(ev_cold::<S> as unsafe extern "C" fn(_, _, _) -> Pair, cx as *const Cx<EvBatch, S> as u64, p as u64, s as u64, 0u64);
+                let Pair(r, nw) = ev_cold(cx, p, s);
                 *w = nw as *mut i64;
                 return tag_far(r as *const u8, lim);
             }};
@@ -1369,19 +1336,14 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
             if _mm256_testz_si256(other, other) == 0 {
                 cold!();
             }
-            if kcall!(ev_fix::<S> as unsafe extern "C" fn(_, _, _) -> u64, cx as *const Cx<EvBatch, S> as u64, p as u64, s as u64, 0u64).0 as u8 == 0 {
+            if ev_fix(cx, p, s) == 0 {
                 cold!();
             }
-        }
-        if core::ptr::read_volatile((s as *const u8).add(PP + 7)) & 2 != 0
-            && kcall!(ev_purchase as unsafe extern "C" fn(_, _, _) -> u64, p as u64, np as u64, s as u64, 0u64).0 as u8 == 0
-        {
-            cold!();
         }
         *w = s.add(1);
         if (s.add(1) as usize) & (A - 1) == 0 {
             (*cx.b).n = NB;
-            kcall!(flush_ev::<S> as unsafe extern "C" fn(_), cx.sink as u64, 0u64, 0u64, 0u64);
+            flush_ev(cx.sink);
             *w = (*cx.b).ts.as_mut_ptr();
             return tag_far(np, lim);
         }
@@ -1395,38 +1357,11 @@ unsafe fn ev_fast<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const
         match ev_s::<S, TAIL>(cx, p, k, *w) {
             Some(st) => ev_d(cx, p, st, np, w, NO_LIM),
             None => {
-                let (r, nw) = kcall!(ev_cold::<S> as unsafe extern "C" fn(_, _, _) -> Pair, cx as *const Cx<EvBatch, S> as u64, p as u64, *w as u64, 0u64);
+                let Pair(r, nw) = ev_cold(cx, p, *w);
                 *w = nw as *mut i64;
                 r as *const u8
             }
         }
-    }
-}
-
-#[cold]
-#[inline(never)]
-unsafe extern "C" fn ev_purchase(p: *const u8, np: *const u8, s: *mut i64) -> u64 {
-    unsafe {
-        let _ = p;
-        let pe = np.wrapping_sub(1);
-        let pt = pe.wrapping_sub(32);
-        let tw = _mm256_loadu_si256(pt as *const __m256i);
-        let q = hi32(tw, b'"') >> 32;
-        let tb = hi32(tw, b',');
-        let r6 = _lzcnt_u64(tb);
-        let r5 = _lzcnt_u64(tb.wrapping_shl(r6 as u32) << 1);
-        let i6 = 32 - r6;
-        let i5 = i6.wrapping_sub(r5).wrapping_sub(1);
-        let qb = (q.wrapping_shr(i6 as u32) & 1) as usize;
-        let qb5 = (q.wrapping_shr(i5 as u32) & 1) as usize;
-        let (r5, r6) = (r5 as usize, r6 as usize);
-        let Some(pr) = price(pe.wrapping_sub(qb), r6 - 2 * qb) else { return 0 };
-        let (prod, bad_p) = dec(ld(pt.wrapping_add(i6 as usize).wrapping_sub(17)), T.prod.get_unchecked(r5 * 2 + qb5));
-        if nz(bad_p) {
-            return 0;
-        }
-        *(s.byte_add(core::mem::offset_of!(EvBatch, pp)) as *mut u64) = prod as u64 | (pr as u64) << 32 | 2 << 56 | if pr == 0 { PP_INVALID } else { 0 };
-        1
     }
 }
 
@@ -1606,7 +1541,7 @@ unsafe fn cl_d<S: ClickSink>(cx: &Cx<CkBatch, S>, p: *const u8, st: ClSt, np: *c
         const A: usize = BATCH_ALIGN;
         macro_rules! cold {
             () => {{
-                let (r, nw) = kcall!(cl_cold::<S> as unsafe extern "C" fn(_, _, _) -> Pair, cx as *const Cx<CkBatch, S> as u64, p as u64, s as u64, 0u64);
+                let Pair(r, nw) = cl_cold(cx, p, s);
                 *w = nw as *mut i64;
                 return r as *const u8;
             }};
@@ -1629,14 +1564,14 @@ unsafe fn cl_d<S: ClickSink>(cx: &Cx<CkBatch, S>, p: *const u8, st: ClSt, np: *c
             if nz(st.bad) {
                 cold!();
             }
-            if kcall!(cl_fix::<S> as unsafe extern "C" fn(_, _, _, _) -> u64, cx as *const Cx<CkBatch, S> as u64, p as u64, np as u64, s as u64).0 as u8 == 0 {
+            if cl_fix(cx, p, np, s) == 0 {
                 cold!();
             }
         }
         *w = s.add(1);
         if (s.add(1) as usize) & (A - 1) == 0 {
             (*cx.b).n = NB;
-            kcall!(flush_ck::<S> as unsafe extern "C" fn(_), cx.sink as u64, 0u64, 0u64, 0u64);
+            flush_ck(cx.sink);
             *w = (*cx.b).ts.as_mut_ptr();
         }
         np
@@ -1649,7 +1584,7 @@ unsafe fn cl_fast<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const
         match cl_s::<S, TAIL>(cx, p, k, *w) {
             Some(st) => cl_d(cx, p, st, np, w),
             None => {
-                let (r, nw) = kcall!(cl_cold::<S> as unsafe extern "C" fn(_, _, _) -> Pair, cx as *const Cx<CkBatch, S> as u64, p as u64, *w as u64, 0u64);
+                let Pair(r, nw) = cl_cold(cx, p, *w);
                 *w = nw as *mut i64;
                 r as *const u8
             }
@@ -1723,7 +1658,7 @@ macro_rules! pipe_stages {
                 let k0 = $masks($p);
                 let mut p1 = k0.next($p);
                 let Some(mut st) = $s::<$S, false>($cx, $p, k0, $w) else {
-                    let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
+                    let Pair(r, nw) = $cold::<$S>($cx, $p, $w);
                     $w = nw as *mut i64;
                     $p = r as *const u8;
                     continue 'outer;
@@ -1741,7 +1676,7 @@ macro_rules! pipe_stages {
                         }
                         $p = r;
                         let Some(stn) = $s::<$S, false>($cx, $p, k1, $w) else {
-                            let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
+                            let Pair(r, nw) = $cold::<$S>($cx, $p, $w);
                             $w = nw as *mut i64;
                             $p = r as *const u8;
                             continue 'outer;
