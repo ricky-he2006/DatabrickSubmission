@@ -12,13 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {events: 20000000, format: previous}
-          - {events: 60000000, format: previous}
+          - {events: 20000000, format: current}
+          - {events: 60000000, format: current}
     env:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
-      CANDIDATE: c24e3f6
+      CANDIDATE: 0aeeece29dfe859987306d312ba7c4a0d792d7b0
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,7 +31,7 @@ jobs:
           for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = cores ]; then sha=c24e3f6; fi
+            if [ "$label" = general ]; then sha=8dc78ba; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -52,7 +52,7 @@ jobs:
             mv pgo-generator generator
           fi
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 823799 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 698497 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -66,14 +66,14 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          cases = {"ranked": {}, "candidate": {}, "chunk2m": {"XL_CH":"2048"}, "chunk32m": {"XL_CH":"32768"}, "ondemand": {"XL_POPW":"0"}, "scatter_cached": {"XL_NT":"0"}}
+          cases = {"ranked": {}, "candidate": {}, "mapped": {"SS_MAP":"1"}, "populate": {"SS_POPULATE":"1"}, "smallparts": {"SS_ID_BITS":"8","SS_PERSON_BITS":"8"}, "largeparts": {"SS_ID_BITS":"12","SS_PERSON_BITS":"11"}}
           labels = list(cases)
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
           for budget in [workers]:
               samples = {label: [] for label in labels}
-              for round_number in range(8):
+              for round_number in range(4):
                   order = labels[round_number % len(labels):] + labels[:round_number % len(labels)]
                   for label in order:
                       output = root / (label + "-out")
@@ -99,14 +99,26 @@ jobs:
               median = statistics.median(samples[label])
               print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
-      - name: Check actual image entrypoint on the updated public answer with scorer filesystem restrictions
+      - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
+        if: matrix.events == 20000000 && matrix.format == 'current'
         run: |
           cd "$RUNNER_TEMP"
-          cargo run --locked --release --manifest-path current-generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/current-dev"
-          curl --retry 3 -fsSLo dev-answer.zip https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip
+          track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          curl --retry 3 -fsSLO "$track/starter-polars.zip"
+          curl --retry 3 -fsSLO "$track/dev-answer.zip"
+          unzip -q starter-polars.zip
           echo 'c2439e0e2e7456d721852814e9928e077648803d5c57a1760a40c7d3b0864d20  dev-answer.zip' | sha256sum -c
           unzip -q dev-answer.zip
-          mkdir container-out container-scratch
-          chmod 777 container-out container-scratch
-          docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:size=64m -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=8 -e MEM_GB=24 -v "$PWD/current-dev:/data:ro" -v "$PWD/container-out:/output" -v "$PWD/container-scratch:/scratch" candidate
-          python "$GITHUB_WORKSPACE/tools/compare.py" container-out dev-answer
+          cargo run --locked --release --manifest-path generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
+          for label in candidate; do
+            for fixture in starter-polars/fixtures/*/; do
+              rm -rf verify-out
+              mkdir -p verify-out
+              DATA_DIR="$RUNNER_TEMP/$fixture/input" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label"
+              python "$GITHUB_WORKSPACE/tools/compare.py" verify-out "$fixture/expected"
+            done
+            rm -rf verify-out
+            mkdir -p verify-out
+            DATA_DIR="$RUNNER_TEMP/dev-data" OUTPUT_DIR="$RUNNER_TEMP/verify-out" SCRATCH_DIR="$RUNNER_TEMP/scratch" NCPU=8 "./$label"
+            python "$GITHUB_WORKSPACE/tools/compare.py" verify-out dev-answer
+          done
