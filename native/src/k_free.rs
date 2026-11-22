@@ -127,7 +127,10 @@ struct JidRow {
     lz: [u8; 32],
     orv: [u64; 4],
 }
-const JID_ROWS: usize = 64 * 64;
+// Wider IDs use the general parser. A non-power-of-two row stride keeps
+// common lengths from competing for the same L1 cache sets.
+const JID_STRIDE: usize = 13;
+const JID_ROWS: usize = 12 * JID_STRIDE;
 
 const fn jid_rows() -> [JidRow; JID_ROWS] {
     let e = id_shapes_raw(b'e', 0, 8, false);
@@ -137,11 +140,11 @@ const fn jid_rows() -> [JidRow; JID_ROWS] {
     bad_u.orv = [0; 2];
     let mut t = [JidRow { ctrl: [0; 32], subv: [0; 32], lz: [0; 32], orv: [0; 4] }; JID_ROWS];
     let mut c0 = 0;
-    while c0 < 64 {
+    while c0 < 12 {
         let mut d = 0;
-        while d < 64 {
+        while d < JID_STRIDE {
             let (a, b) = (&e[c0], if d == 0 { &bad_u } else { &u[d - 1] });
-            let r = &mut t[c0 * 64 + d];
+            let r = &mut t[c0 * JID_STRIDE + d];
             let mut i = 0;
             while i < 16 {
                 r.ctrl[i] = a.ctrl[i];
@@ -766,12 +769,6 @@ unsafe fn and_m(v: __m128i, m: *const u8) -> __m128i {
     o
 }
 #[inline(always)]
-fn jid_off(c0: u64, c1: u64) -> u64 {
-    let o: u64;
-    unsafe { core::arch::asm!("imul {o}, {a}, 63", "add {o}, {b}", "shl {o}, 7", o = out(reg) o, a = in(reg) c0, b = in(reg) c1, options(pure, nomem, nostack)) };
-    o
-}
-#[inline(always)]
 fn add_sub<const D: i32>(a: u64, b: u64) -> u64 {
     let o: u64;
     unsafe { core::arch::asm!("lea {o}, [{a} + {d}]", "sub {o}, {b}", o = out(reg) o, a = in(reg) a, b = in(reg) b, d = const D, options(pure, nomem, nostack)) };
@@ -1291,7 +1288,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let zr = z.wrapping_add(r5);
         let i4 = lea3::<1>(zr, r4) ^ 63;
         let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
-        if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) {
+        if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) | (c0 >= 12) | (c1.wrapping_sub(c0) >= JID_STRIDE as u64) {
             return None;
         }
         core::arch::asm!("test {u}, -3", "jnz {fail}", u = in(reg) u3, fail = label { return None; }, options(nomem, nostack));
@@ -1307,8 +1304,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let kr = &*((T.kind2.as_ptr() as *const u8).add((here((r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize) as u64) as usize) << 6) as *const KindRow2);
         let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.maskv.as_ptr()));
         *(s.byte_add(PP) as *mut u64) = *tr.pp.get_unchecked(qi) | kr.pp;
-        let ro = jid_off(c0 as u64, c1 as u64) as usize;
-        let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
+        let jr = T.jid.get_unchecked(c0 * JID_STRIDE + (c1 - c0));
         let (ids, bad_i) = ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, eid)) as *mut __m128i, _mm256_castsi256_si128(ids));
         _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
