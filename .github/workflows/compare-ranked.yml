@@ -12,12 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - {events: 20000000, format: previous}
           - {events: 60000000, format: previous}
     env:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
-      RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
+      RANKED: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
+      CANDIDATE: 97781b16930eae2e444519c737c171ccef5d90a2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,10 +28,10 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate; do
+          for label in ranked candidate prefetch; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = general ]; then sha=8dc78ba; fi
+            if [ "$label" = prefetch ]; then sha=9fcd7de; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -51,7 +52,7 @@ jobs:
             mv pgo-generator generator
           fi
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 63441 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 674811 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -65,13 +66,13 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "prefetch"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
           for budget in [workers]:
               samples = {label: [] for label in labels}
-              for round_number in range(4):
+              for round_number in range(8):
                   order = labels[round_number % len(labels):] + labels[:round_number % len(labels)]
                   for label in order:
                       output = root / (label + "-out")
