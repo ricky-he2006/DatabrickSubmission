@@ -468,7 +468,7 @@ fn main() {
                 v(c.cat.as_ptr(), c.cat.len()),
                 v(t.edge.as_ptr() as *const u8, t.edge.len() * 16),
                 if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 16 * tid / nt), g.ncsr * 16 * (tid + 1) / nt - g.ncsr * 16 * tid / nt) },
-                if endrel == "2" { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
+                if endrel == "2" && std::env::var("XL_OVL").is_ok_and(|v| v == "0") { let tot = g.files.last().map_or(0, |f| f.off + f.len); v(g.region.wrapping_add(tot * tid / nt), tot * (tid + 1) / nt - tot * tid / nt) } else { (0, 0) },
                 (0, 0),
             ];
         }

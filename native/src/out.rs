@@ -357,6 +357,10 @@ pub fn stage45(g: &mut G, outdir: &str) {
     let ncp = gr_nc_plus1(g);
     let rg_len = gr.files.last().map_or(0, |f| f.off + f.len);
     let rg_todo = AtomicBool::new(REGION_UNMAP.load(Ordering::Relaxed) && rg_len > 0 && !gr.region.is_null());
+    // The parser has copied every raw ID it still needs. Reclaim the input
+    // in large pieces when a worker finishes its output jobs.
+    let input_pages = rg_len.div_ceil(4096);
+    let pages_per_worker = input_pages.div_ceil(nt);
     run_par(nt, |tid| {
         crate::complex::clicks_a(gr, tid);
         ca_done.fetch_add(1, Ordering::AcqRel);
@@ -431,6 +435,13 @@ pub fn stage45(g: &mut G, outdir: &str) {
                 if v.rows > v3[t].rows || (np == 0 && t == 0) {
                     write_rows(&v, v3[t].rows, v.rows, &ud.join(format!("part-{}.parquet", np + t)), &cats_off, &cats_data, &mut kbuf);
                 }
+            }
+        }
+        if !REGION_UNMAP.load(Ordering::Relaxed) {
+            let first = pages_per_worker * tid;
+            let last = (first + pages_per_worker).min(input_pages);
+            if first < last {
+                unsafe { crate::sys::release(gr.region.add(first * 4096), (last - first) * 4096) };
             }
         }
     });
