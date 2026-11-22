@@ -491,6 +491,9 @@ struct Work {
 struct Shared {
     window_start: i64,
     window_end: i64,
+    window_len: u64,
+    click_earliest: i64,
+    click_window_len: u64,
     products: Dim,
     unknown: u32,
     categories: Vec<Vec<u8>>,
@@ -560,7 +563,7 @@ fn manifest_time(text: &str, name: &str) -> i64 {
 
 // ---------------------------------------------------------------- phase 1
 
-fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
+fn read_links(shared: &Shared, block: &mut Block, users: &mut keys::UserCache) -> io::Result<Links> {
     let total_bytes: u64 = shared.link_files.iter().map(|p| p.metadata().map(|m| m.len()).unwrap_or(0)).sum();
     let mut pairs: Vec<(u64, u64)> = Vec::with_capacity((total_bytes / 20) as usize);
     for path in &shared.link_files {
@@ -572,9 +575,9 @@ fn read_links(shared: &Shared, block: &mut Block) -> io::Result<Links> {
             block.load(&source, start, end)?;
             block.raw_lines::<2>(|buf, start, seps| unsafe {
                 let (p, n) = scan::field(buf, start, seps, 0);
-                let a = keys::pack_user(p, n);
+                let a = users.pack_user(p, n);
                 let (p, n) = scan::field(buf, start, seps, 1);
-                let b = keys::pack_user(p, n);
+                let b = users.pack_user(p, n);
                 if a != 0 && b != 0 && a != b {
                     pairs.push((a, b));
                 }
@@ -649,13 +652,19 @@ impl EventSource {
     }
 }
 
-fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
+fn parse_events(
+    shared: &Shared,
+    block: &Block,
+    copy: u64,
+    dates: &mut ts::Dates,
+    users: &mut keys::UserCache,
+    out: &mut EventSource,
+) {
     let id_shift = 64 - shared.id_bits;
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     let window_start = shared.window_start;
-    let window_end = shared.window_end;
     block.raw_lines::<7>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
         let (p, n) = field(0);
@@ -678,7 +687,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             return;
         }
         let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
+        let user = users.pack_user(p, n);
         let user = if user == 0 { 0 } else { user ^ copy };
         let (p, n) = field(2);
         let at = ts::parse(p, n, dates);
@@ -688,21 +697,22 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             let word = u32::from_le((p as *const u32).read_unaligned());
             word == VIEW || word == CART
         };
+        let (p5, n5) = field(5);
+        let at_offset = at.wrapping_sub(window_start) as u64;
+        let in_window = at_offset < shared.window_len;
         let mut valid = user != 0
             && (purchase || other)
-            && field(5).1 > 0
-            && at >= window_start
-            && at < window_end
+            && n5 > 0
+            && in_window
             && ingest - at <= DAY;
         let mut payload = 0;
         if purchase && valid {
-            let (p, n) = field(6);
-            let price = ts::price(p, n);
+            let (p6, n6) = field(6);
+            let price = ts::price(p6, n6);
             if price == 0 {
                 valid = false;
             } else {
-                let (p, n) = field(5);
-                let category = shared.products.get(p, n);
+                let category = shared.products.get(p5, n5);
                 let category = if category == 0 { shared.unknown } else { category - 1 };
                 payload = (category << 24) | price;
             }
@@ -711,7 +721,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
             id,
             user,
             ingest,
-            ts: if valid { (at - window_start) as u32 } else { DEAD },
+            ts: if valid { at_offset as u32 } else { DEAD },
             payload,
         };
         out.buckets.push((partition_hash >> id_shift) as usize, record);
@@ -769,14 +779,14 @@ fn click_order(a: u64, b: u64, sources: &[ClickSource], local: bool) -> std::cmp
 
 fn parse_clicks(
     shared: &Shared,
+    links: &Links,
     block: &Block,
     copy: u64,
     dates: &mut ts::Dates,
+    users: &mut keys::UserCache,
     pending: &mut Vec<RawClick>,
     out: &mut ClickSource,
 ) {
-    let earliest = shared.window_start - WEEK;
-    let window_end = shared.window_end;
     pending.clear();
     block.raw_lines::<4>(|buf, start, seps| unsafe {
         let field = |at: usize| scan::field(buf, start, seps, at);
@@ -789,7 +799,7 @@ fn parse_clicks(
             keys::pack(p, n)
         };
         let (p, n) = field(1);
-        let user = keys::pack_user(p, n);
+        let user = users.pack_user(p, n);
         if id == 0 || user == 0 {
             return;
         }
@@ -798,22 +808,17 @@ fn parse_clicks(
         let campaign = shared.campaigns.get(p, n);
         let (p, n) = field(3);
         let at = ts::parse(p, n, dates);
-        if campaign == 0 || at < earliest || at >= window_end {
+        let click_offset = at.wrapping_sub(shared.click_earliest) as u64;
+        if campaign == 0 || click_offset >= shared.click_window_len {
             return;
         }
         pending.push(RawClick {
             user,
             id,
-            ts: (at - earliest) as u32,
+            ts: click_offset as u32,
             campaign,
         });
     });
-    let links = loop {
-        if let Some(l) = shared.links.get() {
-            break l;
-        }
-        std::hint::spin_loop();
-    };
     for at in 0..pending.len() {
         if let Some(ahead) = pending.get(at + shared.ahead) {
             links.prefetch(ahead.user);
@@ -834,9 +839,10 @@ fn parse_clicks(
 
 fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, ClickSource)> {
     let mut block = Block::new();
+    let mut users = keys::UserCache::new();
     if worker == 0 {
         let began = Instant::now();
-        let links = read_links(shared, &mut block).unwrap_or_else(|error| {
+        let links = read_links(shared, &mut block, &mut users).unwrap_or_else(|error| {
             eprintln!("links: {error}");
             std::process::exit(1);
         });
@@ -847,12 +853,26 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
     let mut clicks = ClickSource::new(1 << shared.person_bits, worker);
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
+    let mut links_opt: Option<&Links> = None;
     while let Some(work) = shared.work.get(shared.next.fetch_add(1, Ordering::Relaxed)) {
         block.load(&shared.files[work.file], work.start, work.end)?;
         if work.events {
-            parse_events(shared, &block, work.copy, &mut dates, &mut events);
+            parse_events(shared, &block, work.copy, &mut dates, &mut users, &mut events);
         } else {
-            parse_clicks(shared, &block, work.copy, &mut dates, &mut pending, &mut clicks);
+            let links = match links_opt {
+                Some(l) => l,
+                None => {
+                    let l = loop {
+                        if let Some(x) = shared.links.get() {
+                            break x;
+                        }
+                        std::hint::spin_loop();
+                    };
+                    links_opt = Some(l);
+                    l
+                }
+            };
+            parse_clicks(shared, links, &block, work.copy, &mut dates, &mut users, &mut pending, &mut clicks);
         }
     }
     Ok((events, clicks))
@@ -1493,9 +1513,15 @@ fn main() -> io::Result<()> {
     let first_day = window_start.div_euclid(DAY);
     let day_offset = (window_start - first_day * DAY) as u64;
     let link_files = csv_files(&data.join("links"))?;
+    let window_len = (window_end - window_start) as u64;
+    let click_earliest = window_start - WEEK;
+    let click_window_len = (window_end - click_earliest) as u64;
     let shared = Shared {
         window_start,
         window_end,
+        window_len,
+        click_earliest,
+        click_window_len,
         products,
         unknown,
         categories,

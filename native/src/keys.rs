@@ -101,31 +101,44 @@ fn intern_name(value: &[u8]) -> (u64, &'static [u8]) {
     (key, name_slice)
 }
 
-thread_local! {
-    static USERS: std::cell::RefCell<Vec<(u64, &'static [u8])>> =
-        std::cell::RefCell::new(vec![(0, &[]); 1 << 15]);
+pub struct UserCache {
+    table: Box<[u64; 1 << 15]>,
+}
+
+impl UserCache {
+    pub fn new() -> Self {
+        Self {
+            table: vec![0u64; 1 << 15].into_boxed_slice().try_into().unwrap(),
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn pack_user(&mut self, p: *const u8, n: usize) -> u64 {
+        if n <= 9 {
+            return unsafe { pack(p, n) };
+        }
+        let value = unsafe { std::slice::from_raw_parts(p, n) };
+        let hash = hash_bytes(value);
+        let slot = (hash >> 49) as usize & ((1 << 15) - 1);
+        let cached = *self.table.get_unchecked(slot);
+        if cached != 0 && name(cached) == value {
+            return cached;
+        }
+        let res = intern_name(value).0;
+        *self.table.get_unchecked_mut(slot) = res;
+        res
+    }
 }
 
 /// Repeated long user names can be resolved by comparing their full bytes
 /// with a worker-local entry. The shared interner assigns the canonical key.
+#[allow(dead_code)]
 #[inline(always)]
 pub unsafe fn pack_user(p: *const u8, n: usize) -> u64 {
     if n <= 9 {
         return unsafe { pack(p, n) };
     }
-    let value = unsafe { std::slice::from_raw_parts(p, n) };
-    let hash = hash_bytes(value);
-    let slot = (hash >> 49) as usize & ((1 << 15) - 1);
-    USERS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let entry = &mut cache[slot];
-        if entry.1 == value {
-            return entry.0;
-        }
-        let res = intern_name(value);
-        *entry = res;
-        res.0
-    })
+    intern(unsafe { std::slice::from_raw_parts(p, n) })
 }
 
 #[inline(always)]
