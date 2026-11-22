@@ -1,4 +1,4 @@
-name: Profile ranked Shopping Sessions engine
+name: Compare ranked Shopping Sessions entry
 on:
   push:
     branches: [larp/compare-ranked]
@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: 6b26052156409cecb7f789d8be4101ccc005f33f
+      CANDIDATE: a326112ff26b0381fa4104e9fcdc27816f88bec6
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,12 +25,12 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked; do
+          for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
-            docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
+            docker build --progress=plain -t "$label" "$RUNNER_TEMP/$label-src"
             cid=$(docker create "$label")
             docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
             docker rm "$cid"
@@ -39,34 +39,47 @@ jobs:
         run: |
           git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 7319 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 4531 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
-      - name: Profile and tune the ranked binary
+      - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
         run: |
-          import os, pathlib, random, shutil, statistics, subprocess, time
+          import os, pathlib, shutil, statistics, subprocess, time
+          import duckdb
+
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          workers = min(len(os.sched_getaffinity(0)), 8)
-          data, output = root / "data", root / "out"
-          env = dict(os.environ, NCPU=str(workers), DATA_DIR=str(data), OUTPUT_DIR=str(output))
-          output.mkdir()
-          subprocess.run([root / "ranked"], env=dict(env, XL_TIMING="1"), check=True)
-          cases = {"default": {}, "read512": {"XL_RD":"512"}, "read2048": {"XL_RD":"2048"},
-                   "release": {"XL_REL":"1","XL_FREE":"1","XL_ENDREL":"2"},
-                   "release_end": {"XL_ENDREL":"2"}, "prefetch": {"XL_PF":"1"},
-                   "no_prefault":{"XL_PREFAULT":"0","XL_POPW":"0"}, "cached_stores":{"XL_NT":"0"},
-                   "chunk1":{"XL_CH":"1024"}, "chunk2":{"XL_CH":"2048"}, "nopin":{"XL_PIN":"0"},
-                   "no_spin":{"XL_SPIN":"0"}, "read512_chunk2":{"XL_RD":"512","XL_CH":"2048"}}
-          times = {k:[] for k in cases}
-          rng = random.Random(18)
-          for i in range(5):
-              order=list(cases)
-              rng.shuffle(order)
-              for name in order:
-                  shutil.rmtree(output)
+          cpus = len(os.sched_getaffinity(0))
+          workers = min(cpus, 8)
+          print(f"Available CPUs {cpus}, workers {workers}", flush=True)
+          labels = ["ranked", "candidate"]
+          samples = {label: [] for label in labels}
+          scratch = root / "scratch"
+          scratch.mkdir()
+          for round_number in range(8):
+              for label in labels[::1 if round_number % 2 == 0 else -1]:
+                  output = root / (label + "-out")
+                  if output.exists():
+                      shutil.rmtree(output)
                   output.mkdir()
-                  start=time.perf_counter()
-                  subprocess.run([root/"ranked"],env=dict(env, **cases[name]), check=True)
-                  times[name].append(time.perf_counter()-start)
-          for name, samples in sorted(times.items(), key=lambda p:statistics.median(p[1])):
-              print("RESULT",name,round(statistics.median(samples),5),samples)
+                  env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
+                             SCRATCH_DIR=str(scratch), NCPU=str(workers))
+                  start = time.perf_counter()
+                  subprocess.run([str(root / label)], env=env, check=True)
+                  seconds = time.perf_counter() - start
+                  print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
+                  if round_number:
+                      samples[label].append(seconds)
+          for table in ["user_daily", "campaign_daily"]:
+              queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
+              a, b = queries
+              for lhs, rhs in [(a, b), (b, a)]:
+                  count = duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]
+                  if count:
+                      raise ValueError(f"{table} differs by {count} rows in one direction")
+          ranked, candidate = (statistics.median(samples[label]) for label in labels)
+          summary = (f"{os.environ['EVENTS']} events, {workers} workers, seven timed runs. "
+                     f"Ranked {ranked:.6f} s. Candidate {candidate:.6f} s. "
+                     f"Candidate/ranked {candidate / ranked:.4f}. Both tables match.")
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              print(summary, file=out)
