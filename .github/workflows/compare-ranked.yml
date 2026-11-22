@@ -11,11 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        events: [20000000, 60000000]
+        include:
+          - {events: 20000000, format: current}
+          - {events: 60000000, format: current}
+          - {events: 20000000, format: previous}
     env:
+      FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: 8dc78ba978bf57cf386fa111be04d9aa0591ca5c
+      CANDIDATE: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +32,7 @@ jobs:
           for label in ranked candidate general; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = general ]; then sha=b33e379; fi
+            if [ "$label" = general ]; then sha=8dc78ba; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -43,8 +47,13 @@ jobs:
           curl --retry 3 -fsSLO "$track/generator.zip"
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
+          if [ "$FORMAT" = previous ]; then
+            git -C "$GITHUB_WORKSPACE" archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x
+            mv generator current-generator
+            mv pgo-generator generator
+          fi
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 91793 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 88331 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -91,7 +100,7 @@ jobs:
               print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
-        if: matrix.events == 20000000
+        if: matrix.events == 20000000 && matrix.format == 'current'
         run: |
           cd "$RUNNER_TEMP"
           track=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
