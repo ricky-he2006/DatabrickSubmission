@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
-      CANDIDATE: 512de088b34e66af601b33013fa7f7a151c80942
+      CANDIDATE: c24e3f6
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,7 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate cores; do
+          for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             if [ "$label" = cores ]; then sha=c24e3f6; fi
@@ -52,7 +52,7 @@ jobs:
             mv pgo-generator generator
           fi
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 718991 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 823799 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -66,7 +66,8 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate", "cores"]
+          cases = {"ranked": {}, "candidate": {}, "chunk2m": {"XL_CH":"2048"}, "chunk32m": {"XL_CH":"32768"}, "ondemand": {"XL_POPW":"0"}, "scatter_cached": {"XL_NT":"0"}}
+          labels = list(cases)
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
@@ -80,9 +81,9 @@ jobs:
                           shutil.rmtree(output)
                       output.mkdir()
                       env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
-                                 SCRATCH_DIR=str(scratch), NCPU=str(budget))
+                                 SCRATCH_DIR=str(scratch), NCPU=str(budget), **cases[label])
                       start = time.perf_counter()
-                      subprocess.run([str(root / label)], env=env, check=True)
+                      subprocess.run([str(root / ("ranked" if label == "ranked" else "candidate"))], env=env, check=True)
                       seconds = time.perf_counter() - start
                       print(f"Round {round_number} {label} {seconds:.6f} s", flush=True)
                       if round_number:
