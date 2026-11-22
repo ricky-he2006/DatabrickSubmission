@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: a63bf4fce0f7c3fcce05951a57ca1dcb7380664d
+      CANDIDATE: 0ed7cf02c4654bc54f8c4a7b55edb9a3d117cdbc
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,12 +25,10 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate memory overlap vector; do
+          for label in ranked candidate memory; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             if [ "$label" = memory ]; then sha=4d47a27; fi
-            if [ "$label" = overlap ]; then sha=0d739bb; fi
-            if [ "$label" = vector ]; then sha=59822cc; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -42,7 +40,7 @@ jobs:
         run: |
           git archive d656f21038990d5725563cd6729ad98b3f7057d1 pgo-generator | tar -x -C "$RUNNER_TEMP"
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/pgo-generator/Cargo.toml" -- \
-            --seed 29467 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 33191 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -56,7 +54,7 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate", "memory", "overlap", "vector"]
+          labels = ["ranked", "candidate", "memory"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
@@ -98,7 +96,7 @@ jobs:
           unzip -q starter-polars.zip
           unzip -q dev-answer.zip
           cargo run --locked --release --manifest-path pgo-generator/Cargo.toml -- --seed 1 --events 1000000 --clicks 250000 --threads 4 --output "$RUNNER_TEMP/dev-data"
-          for label in memory candidate overlap vector; do
+          for label in memory candidate; do
             for fixture in starter-polars/fixtures/*/; do
               rm -rf verify-out
               mkdir -p verify-out
