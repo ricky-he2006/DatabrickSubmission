@@ -14,8 +14,8 @@ jobs:
         events: [20000000, 60000000]
     env:
       EVENTS: ${{ matrix.events }}
-      RANKED: d41d195811014f3886fa156df7b238cc631a4c87
-      CANDIDATE: b33e3798015c5bd07e01a495fd8a06056b81e6ec
+      RANKED: ace14c1c95c0ec080dee913b3fee23357bc1b0b3
+      CANDIDATE: 8dc78ba978bf57cf386fa111be04d9aa0591ca5c
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,10 +25,10 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           lscpu | grep -ow avx512vbmi2 || true
-          for label in sharded candidate general; do
+          for label in partitioned candidate general; do
             sha=$CANDIDATE
-            if [ "$label" = sharded ]; then sha=$RANKED; fi
-            if [ "$label" = general ]; then sha=ace14c1; fi
+            if [ "$label" = partitioned ]; then sha=$RANKED; fi
+            if [ "$label" = general ]; then sha=603aeb6; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -44,7 +44,7 @@ jobs:
           echo '78f973f75d14b48e792628284f19c75de71fa597d20952e16a9ced93c78bee4a  generator.zip' | sha256sum -c
           unzip -q generator.zip
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 15127 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 55231 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -58,7 +58,7 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["sharded", "candidate", "general"]
+          labels = ["partitioned", "candidate", "general"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
@@ -88,7 +88,7 @@ jobs:
                           raise ValueError(f"{table} differs for {b}")
           for label in labels:
               median = statistics.median(samples[label])
-              print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['sharded']):.4f}, both tables match", flush=True)
+              print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['partitioned']):.4f}, both tables match", flush=True)
 
       - name: Verify both candidates at eight workers on the 36 published cases and the official dev answer
         if: matrix.events == 20000000
