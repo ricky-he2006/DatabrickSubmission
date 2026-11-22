@@ -30,7 +30,7 @@ struct Line([u64; 8]);
 
 pub struct Part {
     lines: Vec<Line>,
-    fill: Vec<u8>,
+    fill: Vec<u64>,
     cur: Vec<*mut u64>,
     nch: Vec<u32>,
     n: Vec<u32>,
@@ -39,13 +39,12 @@ pub struct Part {
     blk: *mut u8,
     blk_end: *mut u8,
     popw: bool,
-    pend: Vec<Line>,
 }
 const NOCHUNK: usize = LINK_OFF;
 unsafe impl Send for Part {}
 impl Part {
     pub fn empty() -> Part {
-        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
+        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false }
     }
     pub fn new_unbound(nb: usize) -> Part {
         Part::build(std::ptr::null(), nb)
@@ -68,7 +67,6 @@ impl Part {
             blk: std::ptr::null_mut(),
             blk_end: std::ptr::null_mut(),
             popw: popw(),
-            pend: vec![Line([0; 8]); 72],
         }
     }
     #[inline(always)]
@@ -83,7 +81,7 @@ impl Part {
                 *fp = 0;
                 self.flush(b, l);
             } else {
-                *fp = (f + 16) as u8;
+                *fp = (f + 16) as u64;
             }
         }
     }
@@ -93,74 +91,42 @@ impl Part {
     #[inline(always)]
     pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
         use std::arch::x86_64::*;
-        let fill = self.fill.as_mut_ptr();
-        let full = self.pend.as_mut_ptr() as *mut u64;
-        let mut fp = full;
-        macro_rules! row {
-            ($i:expr) => {{
-                let i = $i;
-                let l = *lp.add(i) as *mut u8;
-                let b = *ob.add(i) as usize;
-                let mut f = *fill.add(b) as usize;
-                if f == 64 {
-                    self.flush_full(full, fp.offset_from(full) as usize);
-                    fp = full;
-                    f = 0;
+        let mut start = 0;
+        while start < n {
+            let live = (m >> start) as u8;
+            let buckets = _mm512_loadu_si512(ob.add(start).cast());
+            // Scatter has unspecified ordering for duplicate addresses. Use the
+            // ordered writer for a partial packet or any repeated destination.
+            if live == 255 && _mm512_test_epi64_mask(_mm512_conflict_epi64(buckets), _mm512_set1_epi64(-1)) == 0 {
+                let fill = self.fill.as_mut_ptr();
+                let offsets = _mm512_i64gather_epi64::<8>(buckets, fill.cast());
+                let next = _mm512_and_si512(_mm512_add_epi64(offsets, _mm512_set1_epi64(16)), _mm512_set1_epi64(63));
+                _mm512_i64scatter_epi64::<8>(fill.cast(), buckets, next);
+                let dest = _mm512_add_epi64(_mm512_slli_epi64::<6>(buckets), offsets);
+                let base = self.lines.as_mut_ptr().cast::<i64>();
+                let lo = _mm512_loadu_si512(rec.add(start).cast());
+                let hi = _mm512_loadu_si512(rec.add(start + 4).cast());
+                let even = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+                let odd = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+                _mm512_i64scatter_epi64::<1>(base, dest, _mm512_permutex2var_epi64(lo, even, hi));
+                _mm512_i64scatter_epi64::<1>(base.add(1), dest, _mm512_permutex2var_epi64(lo, odd, hi));
+                let mut full = _mm512_cmpeq_epi64_mask(next, _mm512_setzero_si512());
+                while full != 0 {
+                    let i = start + full.trailing_zeros() as usize;
+                    self.flush(*ob.add(i) as usize, *lp.add(i) as *mut u64);
+                    full &= full - 1;
                 }
-                _mm_store_si128(l.add(f) as *mut __m128i, _mm_load_si128(rec.add(i) as *const __m128i));
-                let t = f + 16;
-                *fill.add(b) = t as u8;
-                *fp = b as u64;
-                fp = fp.add(t >> 6);
-            }};
-        }
-        if m == (if n >= 64 { !0 } else { (1u64 << n) - 1 }) {
-            for i in 0..n {
-                row!(i);
-            }
-        } else {
-            let mut m = m;
-            while m != 0 {
-                let i = m.trailing_zeros() as usize;
-                m &= m - 1;
-                row!(i);
-            }
-        }
-        self.flush_lines(full, fp.offset_from(full) as usize);
-    }
-    #[inline(always)]
-    unsafe fn flush_lines(&mut self, full: *const u64, k: usize) {
-        const _: () = assert!(LINK_OFF + 64 == CHUNK);
-        let cur = self.cur.as_mut_ptr();
-        let fill = self.fill.as_mut_ptr();
-        let lines = self.lines.as_ptr() as *const u8;
-        macro_rules! flush {
-            ($nt:literal) => {{
-                let mut j = 0;
-                while j != k {
-                    let b = *full.add(j) as usize;
-                    let cp = cur.add(b);
-                    let mut c = *cp;
-                    if (c as usize).wrapping_add(64) & (CHUNK - 1) == 0 {
-                        c = self.new_chunk(b, c);
-                    }
-                    line_out::<$nt>(c as *mut u8, lines.add(64 * b));
-                    *cp = c.add(8);
-                    *fill.add(b) = 0;
-                    j += 1;
+            } else {
+                let mut remaining = live;
+                while remaining != 0 {
+                    let i = start + remaining.trailing_zeros() as usize;
+                    let [a, b] = *rec.add(i);
+                    self.push(*ob.add(i) as usize, a, b);
+                    remaining &= remaining - 1;
                 }
-            }};
+            }
+            start += 8;
         }
-        if NT {
-            flush!(true)
-        } else {
-            flush!(false)
-        }
-    }
-    #[cold]
-    #[inline(never)]
-    unsafe fn flush_full(&mut self, full: *const u64, k: usize) {
-        self.flush_lines(full, k)
     }
     #[inline(always)]
     unsafe fn flush(&mut self, b: usize, l: *mut u64) {
