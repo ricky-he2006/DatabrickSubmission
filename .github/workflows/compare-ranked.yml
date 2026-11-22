@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
-      CANDIDATE: 97781b16930eae2e444519c737c171ccef5d90a2
+      CANDIDATE: c24e3f6411ff06e60baebc03f2cd270f49d73431
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +28,7 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate prefetch; do
+          for label in ranked candidate; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
             if [ "$label" = prefetch ]; then sha=9fcd7de; fi
@@ -52,7 +52,7 @@ jobs:
             mv pgo-generator generator
           fi
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 674811 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 586771 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -66,11 +66,11 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate", "prefetch"]
+          labels = ["ranked", "candidate"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
-          for budget in [workers]:
+          for budget in [max(1, workers//2), workers]:
               samples = {label: [] for label in labels}
               for round_number in range(8):
                   order = labels[round_number % len(labels):] + labels[:round_number % len(labels)]
@@ -88,15 +88,15 @@ jobs:
                       if round_number:
                           samples[label].append(seconds)
               print("AFFINITY", budget, {k:statistics.median(v) for k,v in samples.items()}, flush=True)
-          for table in ["user_daily", "campaign_daily"]:
-              queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
-              for b in queries[1:]:
-                  for lhs, rhs in [(queries[0], b), (b, queries[0])]:
-                      if duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]:
-                          raise ValueError(f"{table} differs for {b}")
-          for label in labels:
-              median = statistics.median(samples[label])
-              print(f"RESULT {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
+              for table in ["user_daily", "campaign_daily"]:
+                  queries = [f"SELECT * FROM read_parquet('{root}/{label}-out/{table}/*.parquet')" for label in labels]
+                  for b in queries[1:]:
+                      for lhs, rhs in [(queries[0], b), (b, queries[0])]:
+                          if duckdb.sql(f"SELECT count(*) FROM ({lhs} EXCEPT ALL {rhs})").fetchone()[0]:
+                              raise ValueError(f"{table} differs for {b}")
+              for label in labels:
+                  median = statistics.median(samples[label])
+                  print(f"RESULT {budget} workers {label} {median:.6f} s, ratio {median/statistics.median(samples['ranked']):.4f}, both tables match", flush=True)
 
       - name: Check actual image entrypoint on the updated public answer with scorer filesystem restrictions
         run: |
