@@ -16,7 +16,13 @@ macro_rules! kernel {
         impl Kernel for $ty {
             const NAME: &'static str = $name;
             fn events<S: EventSink>(buf: &[u8], sink: &mut S) {
-                unsafe { run_events::<S, $mode>(buf, sink) }
+                unsafe {
+                    if std::arch::is_x86_feature_detected!("avx512vbmi2") {
+                        run_events::<S, $mode, true>(buf, sink)
+                    } else {
+                        run_events::<S, $mode, false>(buf, sink)
+                    }
+                }
                 sink.ev_flush();
             }
             fn clicks<S: ClickSink>(buf: &[u8], sink: &mut S) {
@@ -1264,26 +1270,62 @@ struct EvSt {
     bad: __m256i,
 }
 
+// Pack the byte offsets of selected delimiters into the low bytes. The
+// enclosing scanner dispatches once per input block before reaching here.
 #[inline(always)]
-unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8, k: EvMasks, s: *mut i64) -> Option<EvSt> {
+unsafe fn comma_offsets(mask: u64) -> u64 {
+    const OFFSETS: [u8; 64] = {
+        let mut values = [0; 64];
+        let mut i = 0;
+        while i < 64 {
+            values[i] = i as u8;
+            i += 1;
+        }
+        values
+    };
+    let offsets = _mm512_loadu_si512(OFFSETS.as_ptr().cast());
+    let packed: __m512i;
+    core::arch::asm!(
+        "vpcompressb {packed}{{{mask}}}{{z}}, {offsets}",
+        packed = lateout(zmm_reg) packed, mask = in(kreg) mask, offsets = in(zmm_reg) offsets,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    _mm_cvtsi128_si64(_mm512_castsi512_si128(packed)) as u64
+}
+
+#[inline(always)]
+unsafe fn ev_s<S: EventSink, const TAIL: bool, const PACK: bool>(cx: &Cx<EvBatch, S>, p: *const u8, k: EvMasks, s: *mut i64) -> Option<EvSt> {
     unsafe {
         const PP: usize = core::mem::offset_of!(EvBatch, pp);
         let EvMasks { w1c, wbc, wn } = k;
         let m = tz(wn);
         let pb = p.wrapping_add(FB);
-        let c0 = tz2(w1c);
-        let t = blsr(w1c);
-        let c1 = tz2(t);
-        let c2 = tz(blsr(t));
         let tb = bzhi(wbc, m);
-        let z = _lzcnt_u64(tb);
-        let r6 = lea3::<-64>(m, z);
-        let t = tb.wrapping_shl(z as u32) << 1;
-        let r5 = _lzcnt_u64(t);
-        let t = t.wrapping_shl(r5 as u32) << 1;
-        let r4 = _lzcnt_u64(t);
-        let zr = z.wrapping_add(r5);
-        let i4 = lea3::<1>(zr, r4) ^ 63;
+        let (c0, c1, c2, r4, r5, r6, i4) = if PACK {
+            let prefix = comma_offsets(w1c);
+            let count = tb.count_ones();
+            if !(3..=8).contains(&count) || w1c.count_ones() < 3 {
+                return None;
+            }
+            let tail = comma_offsets(tb) >> (8 * (count - 3));
+            let (a, b, c) = (tail & 255, (tail >> 8) & 255, (tail >> 16) & 255);
+            (prefix & 255, (prefix >> 8) & 255, (prefix >> 16) & 255,
+             b - a - 1, c - b - 1, m - c - 1, a + 1)
+        } else {
+            let c0 = tz2(w1c);
+            let t = blsr(w1c);
+            let c1 = tz2(t);
+            let c2 = tz(blsr(t));
+            let z = _lzcnt_u64(tb);
+            let r6 = lea3::<-64>(m, z);
+            let t = tb.wrapping_shl(z as u32) << 1;
+            let r5 = _lzcnt_u64(t);
+            let t = t.wrapping_shl(r5 as u32) << 1;
+            let r4 = _lzcnt_u64(t);
+            let zr = z.wrapping_add(r5);
+            let i4 = lea3::<1>(zr, r4) ^ 63;
+            (c0, c1, c2, r4, r5, r6, i4)
+        };
         let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
         if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) {
             return None;
@@ -1390,9 +1432,9 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
 }
 
 #[inline(always)]
-unsafe fn ev_fast<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8, k: EvMasks, np: *const u8, w: &mut *mut i64) -> *const u8 {
+unsafe fn ev_fast<S: EventSink, const TAIL: bool, const PACK: bool>(cx: &Cx<EvBatch, S>, p: *const u8, k: EvMasks, np: *const u8, w: &mut *mut i64) -> *const u8 {
     unsafe {
-        match ev_s::<S, TAIL>(cx, p, k, *w) {
+        match ev_s::<S, TAIL, PACK>(cx, p, k, *w) {
             Some(st) => ev_d(cx, p, st, np, w, NO_LIM),
             None => {
                 let (r, nw) = kcall!(ev_cold::<S> as unsafe extern "C" fn(_, _, _) -> Pair, cx as *const Cx<EvBatch, S> as u64, p as u64, *w as u64, 0u64);
@@ -1722,7 +1764,7 @@ macro_rules! pipe_stages {
             'outer: while $p <= lim_far {
                 let k0 = $masks($p);
                 let mut p1 = k0.next($p);
-                let Some(mut st) = $s::<$S, false>($cx, $p, k0, $w) else {
+                let Some(mut st) = $s::<$S, false, PACK>($cx, $p, k0, $w) else {
                     let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
                     $w = nw as *mut i64;
                     $p = r as *const u8;
@@ -1740,7 +1782,7 @@ macro_rules! pipe_stages {
                             continue 'outer;
                         }
                         $p = r;
-                        let Some(stn) = $s::<$S, false>($cx, $p, k1, $w) else {
+                        let Some(stn) = $s::<$S, false, PACK>($cx, $p, k1, $w) else {
                             let (r, nw) = kcall!($cold::<$S> as unsafe extern "C" fn(_, _, _) -> Pair, $cx as *const _ as u64, $p as u64, $w as u64, 0u64);
                             $w = nw as *mut i64;
                             $p = r as *const u8;
@@ -1768,7 +1810,7 @@ macro_rules! pipe_stages {
 macro_rules! runner {
     ($name:ident, $sink:ident, $get:ident, $line:ident, $masks:ident, $adv:expr, $scan:ident, $pipe:ident, $s:ident, $d:ident, $cold:ident, $unroll:expr) => {
         #[inline(never)]
-        unsafe fn $name<S: $sink, const MODE: u8>(buf: &[u8], sink: &mut S) {
+        unsafe fn $name<S: $sink, const MODE: u8, const PACK: bool>(buf: &[u8], sink: &mut S) {
             unsafe {
                 let base = buf.as_ptr();
                 let len = buf.len();
@@ -1788,14 +1830,14 @@ macro_rules! runner {
                         while p <= lim {
                             let k = $masks(p);
                             _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(PFD) as *const i8);
-                            p = $line::<S, false>(cx, p, k, k.next(p), &mut w);
+                            p = $line::<S, false, PACK>(cx, p, k, k.next(p), &mut w);
                         }
                     }
                 }
                 let (base, end, b) = (core::ptr::read_volatile(&cx.base), core::ptr::read_volatile(&cx.end), core::ptr::read_volatile(&cx.b));
                 while p.wrapping_add(64) <= end {
                     let k = $masks(p);
-                    p = $line::<S, true>(cx, p, k, k.next(p), &mut w);
+                    p = $line::<S, true, PACK>(cx, p, k, k.next(p), &mut w);
                 }
                 (*b).n = w.offset_from((*b).ts.as_ptr()) as usize;
                 let buf = core::slice::from_raw_parts(base, end.offset_from(base) as usize);
