@@ -1220,7 +1220,6 @@ fn session_worker(
         }
         let capacity = table_keys.len();
         let mask = capacity - 1;
-        let shift = 64 - capacity.trailing_zeros();
         persons.clear();
         ends.clear();
         local.clear();
@@ -1228,7 +1227,7 @@ fn session_worker(
             for &(base, count) in &event_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> shift) as usize & mask;
+                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
                     let id = loop {
                         let key = *table_keys.get_unchecked(slot);
                         if key == person {
@@ -1284,7 +1283,7 @@ fn session_worker(
             for &(base, count) in &click_chunks {
                 for offset in 0..count {
                     let person = (*base.add(offset)).person;
-                    let mut slot = (person.wrapping_mul(MIX) >> shift) as usize & mask;
+                    let mut slot = (person.wrapping_mul(MIX) >> 24) as usize & mask;
                     let id = loop {
                         let key = *table_keys.get_unchecked(slot);
                         if key == person {
