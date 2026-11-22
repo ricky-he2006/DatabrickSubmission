@@ -1879,6 +1879,9 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
         let allowed: Vec<usize> = (0..1024).filter(|&c| m[c / 64] >> (c % 64) & 1 != 0).collect();
         let mut seen = vec![false; 1024];
         let mut out = Vec::new();
+        let mut deferred = Vec::new();
+        let budget = crate::ncpu_env().min(16);
+        let spare_cpus = allowed.len() > budget;
         for &c in &allowed {
             if seen[c] {
                 continue;
@@ -1899,13 +1902,20 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
             if !has_c {
                 grp = vec![c];
             }
+            let mut first = true;
             for x in grp {
                 if x < 1024 && !seen[x] && m[x / 64] >> (x % 64) & 1 != 0 {
                     seen[x] = true;
-                    out.push(x);
+                    if spare_cpus && !first {
+                        deferred.push(x);
+                    } else {
+                        out.push(x);
+                    }
+                    first = false;
                 }
             }
         }
+        out.extend(deferred);
         out
     })
 }
