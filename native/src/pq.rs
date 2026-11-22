@@ -542,7 +542,7 @@ mod tests {
         for count in [1usize, 2, 31, 32, 33, 127, 128, 129, 160, 161, 257, 1000, 4097] {
             for range in [1u64, 2, 14, 1 << 20, 1 << 40, u64::MAX] {
                 let values: Vec<i64> = (0..count)
-                    .map(|_| (i128::from(next() % range) - i128::from(range / 2)) as i64)
+                    .map(|_| (next() % range) as i64 - (range / 2) as i64)
                     .collect();
                 let mut bytes = Vec::new();
                 delta_binary_packed(&mut bytes, &values);

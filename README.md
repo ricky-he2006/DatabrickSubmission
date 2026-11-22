@@ -8,9 +8,10 @@ Parquet tables.
 
 Three phases, each a pool of `NCPU` threads pulling work from a shared counter.
 
-1. **Parse.** Input files are memory-mapped and cut into 512 KB blocks. For each
+1. **Parse.** The workers read 512 KiB blocks into reusable buffers on Linux. Set
+   `SS_MAP=1` to use mapped input. For each
    block a SIMD pass finds every comma, newline and quote, then each line is
-   split, unquoted and parsed into a 28-byte record. IDs of up to 9 ASCII bytes
+   split, unquoted and parsed into a 32-byte record. IDs of up to 9 ASCII bytes
    are packed into a `u64` that sorts like the string; anything else is
    interned. Events are bucketed by a hash of `event_id`, clicks by a hash of
    their person. One thread builds the links table (union-find) first.

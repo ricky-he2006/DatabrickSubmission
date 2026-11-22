@@ -201,6 +201,27 @@ unsafe fn digits_slow(p: *const u8, len: usize) -> i64 {
     }
 }
 
+/// Ingestion timestamps are guaranteed to be F1. Cache the calendar lookup
+/// and decode the three time-of-day pairs directly from their ASCII digits.
+#[inline(always)]
+pub unsafe fn ingest(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
+    unsafe {
+        if len != 20 || *p.add(19) != b'Z' {
+            return parse(p, len, dates);
+        }
+        let pair = |i: usize| {
+            let v = u16::from_le((p.add(i) as *const u16).read_unaligned());
+            i64::from((v & 15) * 10 + ((v >> 8) & 15))
+        };
+        let day = pair(8) as usize;
+        let raw = load64(p);
+        if day >= dates.month.len() || dates.month[day] != raw {
+            return parse(p, len, dates);
+        }
+        (dates.midnight[day] + pair(11) * 3600 + pair(14) * 60 + pair(17)) * 1000
+    }
+}
+
 /// Epoch milliseconds for forms F1, F2 and F3, or `BAD`.
 #[inline(always)]
 pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
@@ -246,12 +267,25 @@ pub unsafe fn parse(p: *const u8, len: usize, dates: &mut Dates) -> i64 {
     }
 }
 
+/// Parse up to eight ASCII digits in one word. The caller supplies a padded
+/// input field. Zero also represents an empty field or a non-decimal byte.
+#[inline(always)]
+unsafe fn small_decimal(p: *const u8, len: usize) -> u32 {
+    debug_assert!((1..=8).contains(&len));
+    let digits = (unsafe { load64(p) } ^ 0x3030_3030_3030_3030) << ((8 - len) * 8);
+    if not_digits(digits) == 0 { eight_digits(digits) as u32 } else { 0 }
+}
+
 /// A purchase price: digits only, 1 to 10,000,000. 0 if it is not one.
 #[inline(always)]
 pub unsafe fn price(p: *const u8, len: usize) -> u32 {
     unsafe {
         if len == 0 {
             return 0;
+        }
+        if len <= 8 {
+            let cents = small_decimal(p, len);
+            return if cents <= 10_000_000 { cents } else { 0 };
         }
         let mut value: u64 = 0;
         for at in 0..len {
@@ -284,15 +318,8 @@ pub unsafe fn numbered(p: *const u8, len: usize, prefix: &[u8]) -> usize {
         if *p.add(skip) == b'0' {
             return usize::MAX;
         }
-        let mut value = 0usize;
-        for at in skip..len {
-            let digit = (*p.add(at)).wrapping_sub(b'0');
-            if digit > 9 {
-                return usize::MAX;
-            }
-            value = value * 10 + digit as usize;
-        }
-        value
+        let number = small_decimal(p.add(skip), len - skip) as usize;
+        if number == 0 { usize::MAX } else { number }
     }
 }
 
