@@ -26,12 +26,15 @@ pub const SKIP: u32 = 0;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
-struct Line([u64; 8]);
+struct Line {
+    pending: [[u64; 2]; 3],
+    cursor: *mut u64,
+    count: usize,
+}
+const _: () = assert!(std::mem::size_of::<Line>() == 64);
 
 pub struct Part {
     lines: Vec<Line>,
-    fill: Vec<u8>,
-    cur: Vec<*mut u64>,
     nch: Vec<u32>,
     n: Vec<u32>,
     head: Vec<*mut u64>,
@@ -39,13 +42,12 @@ pub struct Part {
     blk: *mut u8,
     blk_end: *mut u8,
     popw: bool,
-    pend: Vec<Line>,
 }
 const NOCHUNK: usize = LINK_OFF;
 unsafe impl Send for Part {}
 impl Part {
     pub fn empty() -> Part {
-        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
+        Part { lines: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false }
     }
     pub fn new_unbound(nb: usize) -> Part {
         Part::build(std::ptr::null(), nb)
@@ -58,9 +60,7 @@ impl Part {
     }
     fn build(arena: *const Arena, nb: usize) -> Part {
         Part {
-            lines: vec![Line([0; 8]); nb],
-            fill: vec![0; nb + 64],
-            cur: vec![NOCHUNK as *mut u64; nb],
+            lines: vec![Line { pending: [[0; 2]; 3], cursor: NOCHUNK as *mut u64, count: 0 }; nb],
             nch: vec![0; nb],
             n: vec![0; nb],
             head: vec![std::ptr::null_mut(); nb],
@@ -68,113 +68,57 @@ impl Part {
             blk: std::ptr::null_mut(),
             blk_end: std::ptr::null_mut(),
             popw: popw(),
-            pend: vec![Line([0; 8]); 72],
         }
     }
     #[inline(always)]
     pub fn push(&mut self, b: usize, w0: u64, w1: u64) {
         unsafe {
-            let fp = self.fill.as_mut_ptr().add(b);
-            let f = *fp as usize;
-            let l = self.lines.as_mut_ptr().add(b) as *mut u64;
-            *l.byte_add(f) = w0;
-            *l.byte_add(f + 8) = w1;
-            if f == 48 {
-                *fp = 0;
-                self.flush(b, l);
-            } else {
-                *fp = (f + 16) as u8;
-            }
+            let line = self.lines.as_mut_ptr().add(b);
+            self.append(b, line, [w0, w1]);
         }
     }
     pub fn lines_ptr(&self) -> *const u8 {
         self.lines.as_ptr() as *const u8
     }
     #[inline(always)]
-    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
+    unsafe fn append(&mut self, bucket: usize, line: *mut Line, record: [u64; 2]) {
         use std::arch::x86_64::*;
-        let fill = self.fill.as_mut_ptr();
-        let full = self.pend.as_mut_ptr() as *mut u64;
-        let mut fp = full;
-        macro_rules! row {
-            ($i:expr) => {{
-                let i = $i;
-                let l = *lp.add(i) as *mut u8;
-                let b = *ob.add(i) as usize;
-                let mut f = *fill.add(b) as usize;
-                if f == 64 {
-                    self.flush_full(full, fp.offset_from(full) as usize);
-                    fp = full;
-                    f = 0;
-                }
-                _mm_store_si128(l.add(f) as *mut __m128i, _mm_load_si128(rec.add(i) as *const __m128i));
-                let t = f + 16;
-                *fill.add(b) = t as u8;
-                *fp = b as u64;
-                fp = fp.add(t >> 6);
-            }};
+        let count = (*line).count;
+        if count < 3 {
+            (*line).pending[count] = record;
+            (*line).count = count + 1;
+            return;
         }
+        let mut dst = (*line).cursor;
+        if dst as usize & (CHUNK - 1) == LINK_OFF {
+            dst = self.new_chunk(bucket, dst);
+        }
+        let data = _mm512_inserti32x4::<3>(
+            _mm512_load_si512(line.cast()),
+            _mm_loadu_si128(record.as_ptr().cast()),
+        );
+        if NT {
+            _mm512_stream_si512(dst.cast(), data);
+        } else {
+            _mm512_store_si512(dst.cast(), data);
+        }
+        (*line).cursor = dst.add(8);
+        (*line).count = 0;
+    }
+    #[inline(always)]
+    pub unsafe fn push_many(&mut self, m: u64, n: usize, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
+        let mut append = |i| self.append(*ob.add(i) as usize, *lp.add(i) as *mut Line, *rec.add(i));
         if m == (if n >= 64 { !0 } else { (1u64 << n) - 1 }) {
             for i in 0..n {
-                row!(i);
+                append(i);
             }
         } else {
-            let mut m = m;
-            while m != 0 {
-                let i = m.trailing_zeros() as usize;
-                m &= m - 1;
-                row!(i);
+            let mut mask = m;
+            while mask != 0 {
+                append(mask.trailing_zeros() as usize);
+                mask &= mask - 1;
             }
         }
-        self.flush_lines(full, fp.offset_from(full) as usize);
-    }
-    #[inline(always)]
-    unsafe fn flush_lines(&mut self, full: *const u64, k: usize) {
-        const _: () = assert!(LINK_OFF + 64 == CHUNK);
-        let cur = self.cur.as_mut_ptr();
-        let fill = self.fill.as_mut_ptr();
-        let lines = self.lines.as_ptr() as *const u8;
-        macro_rules! flush {
-            ($nt:literal) => {{
-                let mut j = 0;
-                while j != k {
-                    let b = *full.add(j) as usize;
-                    let cp = cur.add(b);
-                    let mut c = *cp;
-                    if (c as usize).wrapping_add(64) & (CHUNK - 1) == 0 {
-                        c = self.new_chunk(b, c);
-                    }
-                    line_out::<$nt>(c as *mut u8, lines.add(64 * b));
-                    *cp = c.add(8);
-                    *fill.add(b) = 0;
-                    j += 1;
-                }
-            }};
-        }
-        if NT {
-            flush!(true)
-        } else {
-            flush!(false)
-        }
-    }
-    #[cold]
-    #[inline(never)]
-    unsafe fn flush_full(&mut self, full: *const u64, k: usize) {
-        self.flush_lines(full, k)
-    }
-    #[inline(always)]
-    unsafe fn flush(&mut self, b: usize, l: *mut u64) {
-        let cp = self.cur.as_mut_ptr().add(b);
-        let mut c = *cp;
-        if (c as usize & (CHUNK - 1)) == LINK_OFF {
-            c = self.new_chunk(b, c);
-        }
-        if NT {
-            line_out::<true>(c as *mut u8, l as *const u8);
-        } else {
-            line_out::<false>(c as *mut u8, l as *const u8);
-        }
-        *cp = c.add(8);
     }
     #[inline(never)]
     unsafe fn new_chunk(&mut self, b: usize, old: *mut u64) -> *mut u64 {
@@ -198,20 +142,20 @@ impl Part {
     pub fn finish(&mut self) {
         unsafe {
             for b in 0..self.head.len() {
-                let f = self.fill[b] as usize / 8;
+                let f = self.lines[b].count * 2;
                 if f > 0 {
-                    let mut c = self.cur[b];
+                    let mut c = self.lines[b].cursor;
                     if (c as usize & (CHUNK - 1)) == LINK_OFF {
                         c = self.new_chunk(b, c);
                     }
                     std::ptr::copy_nonoverlapping(self.lines.as_ptr().add(b) as *const u64, c, f);
-                    self.cur[b] = c.add(f);
-                    self.fill[b] = 0;
+                    self.lines[b].cursor = c.add(f);
+                    self.lines[b].count = 0;
                 }
                 self.n[b] = if self.head[b].is_null() {
                     0
                 } else {
-                    let cur = self.cur[b] as usize;
+                    let cur = self.lines[b].cursor as usize;
                     let last = (cur - 1) & !(CHUNK - 1);
                     (self.nch[b] - 1) * (LINK_OFF as u32 / 16) + ((cur - last) / 16) as u32
                 };
@@ -231,7 +175,7 @@ impl Part {
             if c.is_null() {
                 return;
             }
-            let cur = self.cur[b] as usize;
+            let cur = self.lines[b].cursor as usize;
             let last = (cur - 1) & !(CHUNK - 1);
             loop {
                 if c as usize == last {
@@ -338,15 +282,6 @@ unsafe fn mul4(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> 
     let r: std::arch::x86_64::__m256i;
     std::arch::asm!("vpmullq {r}, {x}, {y}", r = lateout(ymm_reg) r, x = in(ymm_reg) a, y = in(ymm_reg) b, options(pure, nomem, nostack, preserves_flags));
     r
-}
-#[inline(always)]
-unsafe fn line_out<const NT: bool>(dst: *mut u8, src: *const u8) {
-    use std::arch::x86_64::*;
-    if NT {
-        _mm512_stream_si512(dst as *mut __m512i, _mm512_load_si512(src as *const __m512i));
-    } else {
-        _mm512_storeu_si512(dst as *mut __m512i, _mm512_load_si512(src as *const __m512i));
-    }
 }
 #[inline(always)]
 pub(crate) unsafe fn eq64(p: *const u8, c: u8) -> u64 {
