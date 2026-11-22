@@ -29,10 +29,9 @@ jobs:
           git fetch --all
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -w avx512bw /proc/cpuinfo || echo "avx512bw not in flags"
-          for label in ranked candidate general; do
+          for label in candidate general; do
             sha=$CANDIDATE
-            if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = general ]; then sha=d62e8f13468b5a160f1ffce2c7acdac7c88c58dc; fi
+            if [ "$label" = general ]; then sha=ec5af6257f5d16e2b13bac848ce859c090963892; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             sed -i 's/cascadelake/x86-64-v3/g' "$RUNNER_TEMP/$label-src/native/.cargo/config.toml" 2>/dev/null || true
@@ -68,7 +67,7 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate", "general"]
+          labels = ["candidate", "general"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
