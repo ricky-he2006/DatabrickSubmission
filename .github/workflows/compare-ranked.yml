@@ -18,7 +18,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       EVENTS: ${{ matrix.events }}
       RANKED: 554c049b963548dbde9e0c187eed1ecf24b5cf1d
-      CANDIDATE: 39bf389622aeb848a8f32cead65e13514e2de7c2
+      CANDIDATE: f69ac144c9851d3fa374c2ca1f6d55531c37f226
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,10 +28,10 @@ jobs:
         run: |
           lscpu | grep -E '^Model name|^CPU\(s\)|^Thread'
           grep -qw avx512bw /proc/cpuinfo
-          for label in ranked candidate; do
+          for label in ranked candidate layout; do
             sha=$CANDIDATE
             if [ "$label" = ranked ]; then sha=$RANKED; fi
-            if [ "$label" = prefetch ]; then sha=9fcd7de; fi
+            if [ "$label" = layout ]; then sha=39bf389; fi
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build -q -t "$label" "$RUNNER_TEMP/$label-src"
@@ -52,7 +52,7 @@ jobs:
             mv pgo-generator generator
           fi
           cargo run --locked --release --manifest-path "$RUNNER_TEMP/generator/Cargo.toml" -- \
-            --seed 987123 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
+            --seed 563497 --events "$EVENTS" --clicks "$(( EVENTS / 4 ))" --threads "$(nproc)" --output "$RUNNER_TEMP/data"
           python -m pip install --quiet duckdb==1.4.5
       - name: Alternate process-start-to-exit runs and compare all Parquet rows
         shell: python
@@ -66,7 +66,7 @@ jobs:
           for cpu in os.sched_getaffinity(0):
               print(cpu,pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text().strip())
           print(f"Available CPUs {cpus}, workers {workers}", flush=True)
-          labels = ["ranked", "candidate"]
+          labels = ["ranked", "candidate", "layout"]
           samples = {label: [] for label in labels}
           scratch = root / "scratch"
           scratch.mkdir()
