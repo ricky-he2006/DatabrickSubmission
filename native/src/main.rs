@@ -585,6 +585,22 @@ fn person_part(person: u64, bits: u32) -> usize {
 const LONG_EVENT: u64 = 3 << 62;
 const EVENT_FINGERPRINT: u64 = (1 << 30) - 1;
 
+/// A hash selects the dedup bucket. Collisions are resolved by all 33 bytes.
+#[inline(always)]
+fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    unsafe {
+        use std::arch::x86_64::_mm_crc32_u64;
+        let mut crc = u64::from(bytes[0]);
+        for word in bytes[1..].chunks_exact(8) {
+            crc = _mm_crc32_u64(crc, u64::from_le_bytes(word.try_into().unwrap()));
+        }
+        crc & EVENT_FINGERPRINT
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+    { keys::hash_bytes(bytes) & EVENT_FINGERPRINT }
+}
+
 struct EventSource {
     buckets: Buckets<Parsed>,
     names: Vec<[u8; 33]>,
@@ -602,7 +618,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let (p, n) = field(0);
         let (id, partition_hash) = if n == 33 && shared.defer_long_events {
             let bytes = &*p.cast::<[u8; 33]>();
-            let fingerprint = keys::hash_bytes(bytes) & EVENT_FINGERPRINT;
+            let fingerprint = event_fingerprint(bytes);
             let index = u32::try_from(out.names.len()).expect("too many long event IDs in one worker");
             out.names.push(*bytes);
             (LONG_EVENT | (fingerprint << 32) | index as u64, fingerprint.wrapping_mul(MIX))
