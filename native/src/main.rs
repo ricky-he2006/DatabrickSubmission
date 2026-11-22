@@ -186,8 +186,8 @@ impl<T: Copy> Buckets<T> {
 struct Parsed {
     id: u64,
     user: u64,
-    /// Full UTC ingestion time, including copies ingested before the window.
-    ingest: i64,
+    /// Milliseconds relative to the input window or an index into overflow times.
+    ingest: u32,
     /// Milliseconds after `window_start`, or `DEAD`.
     ts: u32,
     /// 0, or for a purchase its category in the top 8 bits and price below.
@@ -603,7 +603,29 @@ fn event_fingerprint(bytes: &[u8; 33]) -> u64 {
 
 struct EventSource {
     buckets: Buckets<Parsed>,
+    extended_times: Vec<i64>,
     names: Vec<[u8; 33]>,
+}
+
+const EXTENDED_TIME: u32 = 0xf000_0000;
+
+impl EventSource {
+    #[inline(always)]
+    fn store_ingest(&mut self, timestamp: i64, base: i64) -> u32 {
+        let delta = timestamp.wrapping_sub(base) as u64;
+        if delta < u64::from(EXTENDED_TIME) {
+            return delta as u32;
+        }
+        let index = u32::try_from(self.extended_times.len()).expect("too many extended timestamps");
+        let token = EXTENDED_TIME.checked_add(index).expect("too many extended timestamps");
+        self.extended_times.push(timestamp);
+        token
+    }
+
+    fn timestamp(&self, token: u32, base: i64) -> i64 {
+        if token < EXTENDED_TIME { base + i64::from(token) }
+        else { self.extended_times[(token - EXTENDED_TIME) as usize] }
+    }
 }
 
 fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates, out: &mut EventSource) {
@@ -668,7 +690,7 @@ fn parse_events(shared: &Shared, block: &Block, copy: u64, dates: &mut ts::Dates
         let record = Parsed {
             id,
             user,
-            ingest,
+            ingest: out.store_ingest(ingest, window_start - WEEK),
             ts: if valid { (at - window_start) as u32 } else { DEAD },
             payload,
         };
@@ -773,7 +795,7 @@ fn parse_worker(shared: &Shared, worker: usize) -> io::Result<(EventSource, Clic
         LINKS_MICROS.store(began.elapsed().as_micros() as usize, Ordering::Relaxed);
         let _ = shared.links.set(links);
     }
-    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), names: Vec::new() };
+    let mut events = EventSource { buckets: Buckets::new(1 << shared.id_bits), extended_times: Vec::new(), names: Vec::new() };
     let mut clicks = ClickSource { buckets: Buckets::new(1 << shared.person_bits), names: Vec::new(), worker };
     let mut pending = Vec::new();
     let mut dates = ts::Dates::new();
@@ -848,7 +870,15 @@ fn dedup_worker(shared: &Shared, sources: &[EventSource], next: &AtomicUsize) ->
                             id == other_id
                         };
                         if equal {
-                            if (*record).ingest < (*other).ingest {
+                            let (new, old) = ((*record).ingest, (*other).ingest);
+                            let earlier = if new.max(old) < EXTENDED_TIME {
+                                new < old
+                            } else {
+                                let base = shared.window_start - WEEK;
+                                let old_owner = owners[(seen >> OFFSET_BITS) as usize];
+                                sources[owners[index]].timestamp(new, base) < sources[old_owner].timestamp(old, base)
+                            };
+                            if earlier {
                                 (*other).ts = DEAD;
                                 *table.get_unchecked_mut(slot) = entry;
                             } else {
