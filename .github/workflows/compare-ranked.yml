@@ -15,7 +15,7 @@ jobs:
     env:
       EVENTS: ${{ matrix.events }}
       RANKED: ddf01a25268b146b6c6b1bd3a2fc41b90525e4fb
-      CANDIDATE: 754567a10bb9204b960bd85d36dad412808fb495
+      CANDIDATE: 1a6bd49e522da7da4e6f0e07c661e3566bddedc5
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +31,25 @@ jobs:
             mkdir "$RUNNER_TEMP/$label-src"
             git archive "$sha" | tar -x -C "$RUNNER_TEMP/$label-src"
             docker build --build-arg TRAIN_PROFILE=0 --progress=plain -t "$label" "$RUNNER_TEMP/$label-src"
+            cid=$(docker create "$label")
+            docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
+            docker rm "$cid"
+          done
+      - name: Build cache and scheduling variants of the candidate
+        run: |
+          cd "$RUNNER_TEMP/candidate-src"
+          cp Dockerfile Dockerfile.original
+          cp native/src/k_free.rs /tmp/kernel.original
+          for label in bucket13 bucket15 unroll2 prefetch4k; do
+            cp Dockerfile.original Dockerfile
+            cp /tmp/kernel.original native/src/k_free.rs
+            case "$label" in
+              bucket13) sed -i '/^ARG TRAIN_PROFILE/a ENV XL_BB=13' Dockerfile ;;
+              bucket15) sed -i '/^ARG TRAIN_PROFILE/a ENV XL_BB=15' Dockerfile ;;
+              unroll2) sed -i 's/const UNROLL_EV: usize = 1/const UNROLL_EV: usize = 2/' native/src/k_free.rs ;;
+              prefetch4k) sed -i 's/const PFD: usize = 1024/const PFD: usize = 4096/' native/src/k_free.rs ;;
+            esac
+            docker build --build-arg TRAIN_PROFILE=0 -q -t "$label" .
             cid=$(docker create "$label")
             docker cp "$cid:/app/shopping-sessions" "$RUNNER_TEMP/$label"
             docker rm "$cid"
@@ -60,6 +79,8 @@ jobs:
                    "populate":{"XL_POPULATE_INPUT":"1"}, "click_index":{"XL_CKIX":"1"},
                    "click_parts":{"XL_CKIX":"2"}, "teardown":{"XL_ENDREL":"2"},
                    "long_prefetch":{"XL_PF":"1","XL_ENDREL":"2"}}
+          binaries = ["ranked", "candidate", "bucket13", "bucket15", "unroll2", "prefetch4k"]
+          cases.update({label:{} for label in binaries[2:]})
           samples = {label:[] for label in cases}
           rng=random.Random(43)
           for round_number in range(6):
@@ -73,7 +94,7 @@ jobs:
                   env = dict(os.environ, DATA_DIR=str(root / "data"), OUTPUT_DIR=str(output),
                              SCRATCH_DIR=str(scratch), NCPU=str(workers), **cases[label])
                   start = time.perf_counter()
-                  subprocess.run([str(root / ("ranked" if label=="ranked" else "candidate"))], env=env, check=True)
+                  subprocess.run([str(root / (label if label in binaries else "candidate"))], env=env, check=True)
                   seconds = time.perf_counter() - start
                   if round_number:
                       samples[label].append(seconds)
