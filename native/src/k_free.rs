@@ -1403,15 +1403,27 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
         let (ja, jb, jc, jd, je, jf) = (&tj.a, &tj.b, &tj.c, &tj.d, &tj.e, &tj.f);
         let ld2 = |q: *const u8| _mm256_load_si256(q as *const __m256i);
         let d = _mm256_sub_epi8(_mm256_shuffle_epi8(st.x, ld2(ja.ctrl.as_ptr())), ld2(ja.base.as_ptr()));
-        let m1 = _mm256_maddubs_epi16(d, ld2(jb.w1.as_ptr() as *const u8));
-        let m2 = _mm256_madd_epi16(m1, ld2(jc.w2.as_ptr() as *const u8));
-        let m3 = _mm256_madd_epi16(_mm256_packus_epi32(m2, m2), ld2(jc.w3.as_ptr() as *const u8));
-        let (bad_ta, bad_tb) = (_mm256_subs_epu8(d, ld2(jb.lim.as_ptr())), _mm256_cmpgt_epi32(m2, ld2(jd.limv.as_ptr() as *const u8)));
-        let t = _mm256_mul_epu32(m3, ld2(je.kme.as_ptr() as *const u8));
-        let f = _mm256_mul_epi32(_mm256_srli_epi64::<32>(m3), ld2(je.kmf.as_ptr() as *const u8));
-        let ksub = _mm256_testn_epi64_mask(d, ld2(jf.ksel.as_ptr()));
-        let r = _mm256_mask_sub_epi64(_mm256_add_epi64(t, f), ksub, t, f);
-        let r = _mm256_add_epi64(r, st.days);
+        // Two UTC timestamps have identical decimal weights and no timezone
+        // adjustments. Quotes only change the shuffle and validation masks.
+        let shape = (jo >> 9) - 2;
+        let bad_ta = _mm256_subs_epu8(d, ld2(jb.lim.as_ptr()));
+        let (r, bad_tb) = if shape & !5 == 40 {
+            let utc = &T.tj[40];
+            let pairs = _mm256_maddubs_epi16(d, ld2(utc.b.w1.as_ptr().cast()));
+            let units = _mm256_madd_epi16(pairs, ld2(utc.c.w2.as_ptr().cast()));
+            let seconds = _mm256_madd_epi16(_mm256_packus_epi32(units, units), ld2(utc.c.w3.as_ptr().cast()));
+            let millis = _mm256_mul_epu32(seconds, ld2(utc.e.kme.as_ptr().cast()));
+            (_mm256_add_epi64(millis, st.days), _mm256_cmpgt_epi32(units, ld2(utc.d.limv.as_ptr().cast())))
+        } else {
+            let m1 = _mm256_maddubs_epi16(d, ld2(jb.w1.as_ptr() as *const u8));
+            let m2 = _mm256_madd_epi16(m1, ld2(jc.w2.as_ptr() as *const u8));
+            let m3 = _mm256_madd_epi16(_mm256_packus_epi32(m2, m2), ld2(jc.w3.as_ptr() as *const u8));
+            let t = _mm256_mul_epu32(m3, ld2(je.kme.as_ptr() as *const u8));
+            let f = _mm256_mul_epi32(_mm256_srli_epi64::<32>(m3), ld2(je.kmf.as_ptr() as *const u8));
+            let ksub = _mm256_testn_epi64_mask(d, ld2(jf.ksel.as_ptr()));
+            let r = _mm256_mask_sub_epi64(_mm256_add_epi64(t, f), ksub, t, f);
+            (_mm256_add_epi64(r, st.days), _mm256_cmpgt_epi32(m2, ld2(jd.limv.as_ptr().cast())))
+        };
         store_hi::<0>(s, _mm256_castsi256_si128(r));
         _mm_storeu_si128(s.byte_add(core::mem::offset_of!(EvBatch, ing)) as *mut __m128i, _mm256_extracti128_si256::<1>(r));
         let all = _mm256_ternarylogic_epi64::<0xFE>(bad_ta, bad_tb, st.bad2);
